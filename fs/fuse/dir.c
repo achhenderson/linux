@@ -549,7 +549,7 @@ int fuse_valid_type(int m)
 		S_ISBLK(m) || S_ISFIFO(m) || S_ISSOCK(m);
 }
 
-static bool fuse_valid_size(u64 size)
+bool fuse_valid_size(u64 size)
 {
 	return size <= LLONG_MAX;
 }
@@ -2496,7 +2496,7 @@ static int fuse_symlink_read_folio(struct file *null, struct folio *folio)
 	return err;
 }
 
-static const struct address_space_operations fuse_symlink_aops = {
+const struct address_space_operations fuse_symlink_aops = {
 	.read_folio	= fuse_symlink_read_folio,
 };
 
