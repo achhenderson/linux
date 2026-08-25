@@ -1060,6 +1060,36 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			percpu_down_write(wb_sem);
 
 			/*
+			 * Ask what is left to do, under the gate so no
+			 * reader can populate and no writer can dirty
+			 * between the answer and the drop below.
+			 *
+			 * Nothing cached in the range means the drop is a
+			 * no-op and the revoke is the whole job.  Otherwise
+			 * the record decides whether the drop has to
+			 * launder, which is what makes it wait for a
+			 * FUSE_WRITE reply.
+			 */
+			has_pages = filemap_range_has_page(inode->i_mapping,
+							   offset, end_byte);
+			may_be_dirty = fuse_dlm_range_may_be_dirty(fi, pg_first,
+								   pg_last);
+
+			/*
+			 * Start unwritten data on its way while the grant
+			 * still covers it, rather than leaving it to the
+			 * drop below.  After the revoke those bytes
+			 * classify as FUSE_DLM_RUN_REVOKED, and writeback
+			 * would take the range again to send them: a DLM
+			 * round trip from inside the handler the server is
+			 * waiting on.  do_writepages() runs in this context,
+			 * so the classification is made before the revoke.
+			 */
+			if (has_pages && may_be_dirty)
+				filemap_fdatawrite_range(inode->i_mapping,
+							 offset, end_byte);
+
+			/*
 			 * Revoke the DLM lock range under the gate write
 			 * side, atomically with the page drop: gate readers
 			 * re-validate their grant right after entering, and
@@ -1068,22 +1098,6 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 */
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_revoke_inval_range(fi, offset, len);
-
-			/*
-			 * Ask what is left to do, under the gate so no
-			 * reader can populate and no writer can dirty
-			 * between the answer and the drop below.
-			 *
-			 * Nothing cached in the range means the drop is a
-			 * no-op; the revoke above was the whole job.
-			 * Otherwise the record decides whether the drop has
-			 * to launder, which is what makes it wait for a
-			 * FUSE_WRITE reply.
-			 */
-			has_pages = filemap_range_has_page(inode->i_mapping,
-							   offset, end_byte);
-			may_be_dirty = fuse_dlm_range_may_be_dirty(fi, pg_first,
-								   pg_last);
 
 			if (enable_notify_dio && hot && has_writer &&
 			    !mapping_mapped(inode->i_mapping) &&
@@ -1110,6 +1124,18 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 				fuse_notify_invalidate_range(inode, pg_start,
 							     pg_end,
 							     may_be_dirty);
+
+			/*
+			 * A revoked range exists to describe page cache
+			 * dirtied before the grant went; with that cache
+			 * gone it has nothing left to say.  Only when it
+			 * really went: an invalidate can leave a busy folio
+			 * behind, and that folio still needs its record.
+			 */
+			if (has_pages &&
+			    !filemap_range_has_page(inode->i_mapping, offset,
+						    end_byte))
+				fuse_dlm_ranges_dropped(fi, pg_first, pg_last);
 
 			percpu_up_write(wb_sem);
 

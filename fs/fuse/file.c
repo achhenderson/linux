@@ -2945,6 +2945,12 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 
 	WARN_ON_ONCE(!data);
 
+	if (!data->ff) {
+		data->ff = fuse_write_file_get(fi);
+		if (!data->ff)
+			return -EIO;
+	}
+
 	/*
 	 * A folio iomap has not asked about before: the one before it has all
 	 * of its runs queued, so let go of the bias holding its count open.
@@ -2961,19 +2967,12 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 	 * of the boundary page was never read in.  Send only what was
 	 * written, so the untouched remainder is not handed to the server.
 	 *
-	 * fuse_dlm_dirty_run() reports the run from @pos that is uniformly
-	 * written or uniformly not, and refuses to answer for a range not
-	 * covered by write grants throughout, where something outside its
-	 * record could have dirtied the folio.  In that case the whole
-	 * range goes, as it did before.
-	 *
-	 * A run that was not written is reported to iomap as a hole, which
-	 * skips it and, for a folio with no written run at all, ends the
-	 * folio writeback itself.  iomap calls back for the next run.
+	 * fuse_dlm_dirty_run() classifies the run from @pos and says how far
+	 * the answer holds.  iomap calls back for the rest.
 	 */
 	if (fc->dlm && fc->writeback_cache) {
-		bool dirty;
-		size_t run = fuse_dlm_dirty_run(fi, pos, len, &dirty);
+		size_t run = len;
+		int err;
 
 		/*
 		 * wpc->iomap.type carries over from the previous run and from
@@ -2984,22 +2983,41 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		 */
 		wpc->iomap.type = IOMAP_MAPPED;
 
-		if (run) {
-			if (!dirty) {
-				wpc->iomap.type = IOMAP_HOLE;
-				return run;
-			}
+		switch (fuse_dlm_dirty_run(fi, pos, len, &run)) {
+		case FUSE_DLM_RUN_UNKNOWN:
+			/*
+			 * No record for this range: send it whole, as
+			 * without DLM.
+			 */
+			break;
+		case FUSE_DLM_RUN_CLEAN:
+			/*
+			 * Nothing was written here.  Reported as a hole so
+			 * iomap skips it and, for a folio with no written
+			 * run at all, ends the folio writeback itself.
+			 */
+			wpc->iomap.type = IOMAP_HOLE;
+			return run;
+		case FUSE_DLM_RUN_REVOKED:
+			/*
+			 * Written under a grant the server has since taken
+			 * away.  The bytes are real, so hold the range again
+			 * rather than lose them.  A failure leaves the run
+			 * classified revoked and the folio dirty, so the next
+			 * writeback tries again; only a hard error stops it.
+			 */
+			err = fuse_dlm_regrant_range(data->ff, inode, pos,
+						     pos + run - 1);
+			if (err < 0 && err != -ENOSYS)
+				return err;
+			fallthrough;
+		case FUSE_DLM_RUN_DIRTY:
 			len = run;
+			break;
 		}
 	}
 
 	offset = offset_in_folio(folio, pos);
-
-	if (!data->ff) {
-		data->ff = fuse_write_file_get(fi);
-		if (!data->ff)
-			return -EIO;
-	}
 
 	if (wpa && fuse_writepage_need_send(fc, pos, len, ap, data, wpc->wbc)) {
 		fuse_writepages_send(inode, data);

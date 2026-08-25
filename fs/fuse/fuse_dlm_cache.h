@@ -14,6 +14,7 @@
 
 struct fuse_inode;
 struct fuse_dlm_range;
+struct fuse_file;
 
 /* Lock modes for page ranges */
 enum fuse_page_lock_mode { FUSE_PAGE_LOCK_READ, FUSE_PAGE_LOCK_WRITE };
@@ -30,15 +31,16 @@ enum fuse_page_lock_mode { FUSE_PAGE_LOCK_READ, FUSE_PAGE_LOCK_WRITE };
 /*
  * Page cache lock manager.
  *
- * @ranges holds the grants the client has been given and not had taken
- * back.  A request still on the wire covers nothing and lives on
- * @pending instead, so tree walkers never filter on state.  See enum
- * fuse_dlm_range_state in fuse_dlm_cache.c.
+ * @ranges holds the grants the client has been given, and the ones it
+ * has had taken back that still describe page cache
+ * (FUSE_DLM_RANGE_REVOKED).  A request still on the wire covers nothing
+ * and lives on @pending instead, so tree walkers never filter on state.
+ * See enum fuse_dlm_range_state in fuse_dlm_cache.c.
  */
 struct fuse_dlm_cache {
 	/* Lock protecting the tree and the pending list */
 	struct rw_semaphore lock;
-	/* Interval tree of granted ranges (FUSE_DLM_RANGE_READ/_WRITE) */
+	/* Interval tree of recorded ranges, granted or revoked */
 	struct rb_root_cached ranges;
 	/*
 	 * FUSE_DLM_WB_LOCK requests in flight (REQUESTED, or REVOKED once
@@ -111,13 +113,36 @@ void fuse_dlm_range_touched(struct fuse_inode *inode, uint64_t start,
 void fuse_dlm_ranges_flushed(struct fuse_inode *inode, uint64_t start,
 			     uint64_t end);
 
+/* What writeback should do with a run; see fuse_dlm_dirty_run() */
+enum fuse_dlm_run {
+	/* No record: write the whole range, as without DLM */
+	FUSE_DLM_RUN_UNKNOWN,
+	/* Nothing was written here */
+	FUSE_DLM_RUN_CLEAN,
+	/* Written under a grant still held */
+	FUSE_DLM_RUN_DIRTY,
+	/* Written, but the grant has since been taken away */
+	FUSE_DLM_RUN_REVOKED,
+};
+
 /*
- * Length of the run from @pos, capped at @len, over which the recorded
- * content does not change; @dirty says which it is.  0 means the record
- * cannot answer and the caller must assume the whole range is dirty.
+ * Classify the run from @pos, setting @run to how far the answer holds,
+ * capped at @len.  @run is left alone for FUSE_DLM_RUN_UNKNOWN.
  */
-size_t fuse_dlm_dirty_run(struct fuse_inode *inode, uint64_t pos, size_t len,
-			  bool *dirty);
+enum fuse_dlm_run fuse_dlm_dirty_run(struct fuse_inode *inode, uint64_t pos,
+				     size_t len, size_t *run);
+
+/*
+ * The page cache under [start, end] is gone: free the revoked ranges over
+ * it and reset the content of the ones still held.  The caller must have
+ * established the range really is empty.
+ */
+void fuse_dlm_ranges_dropped(struct fuse_inode *inode, uint64_t start,
+			     uint64_t end);
+
+/* Hold [start, end] again so writeback can send what it found revoked */
+int fuse_dlm_regrant_range(struct fuse_file *ff, struct inode *inode,
+			   uint64_t start, uint64_t end);
 
 /*
  * Can [start, end] hold data the server has not seen?  A part of it with
