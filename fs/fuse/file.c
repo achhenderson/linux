@@ -556,11 +556,15 @@ u64 fuse_lock_owner_id(struct fuse_conn *fc, fl_owner_t id)
 	return (u64) v0 + ((u64) v1 << 32);
 }
 
+struct fuse_wb_token;
+
 struct fuse_writepage_args {
 	struct fuse_io_args ia;
 	struct list_head queue_entry;
 	struct inode *inode;
 	struct fuse_sync_bucket *bucket;
+	/* One per entry of ia.ap.folios, see struct fuse_wb_token */
+	struct fuse_wb_token **tokens;
 };
 
 /*
@@ -2596,6 +2600,77 @@ static ssize_t fuse_splice_write(struct pipe_inode_info *pipe, struct file *out,
 		return iter_file_splice_write(pipe, out, ppos, len, flags);
 }
 
+/*
+ * A folio is written back one recorded run at a time, and a run that does
+ * not reach both folio edges forces a new request, so the runs of one folio
+ * end up in requests that complete independently.  iomap counts a folio's
+ * outstanding writes in ifs->write_bytes_pending, but a folio of a single
+ * block carries no iomap_folio_state, and there iomap_finish_folio_write()
+ * ends the writeback on every call.  Count the runs here instead and end
+ * the folio writeback once, on the last one.
+ */
+struct fuse_wb_token {
+	refcount_t refs;
+	struct inode *inode;
+	struct folio *folio;
+};
+
+/*
+ * Take @folio into writeback and open the count.  The caller keeps the
+ * returned reference as a bias, so the count cannot reach zero while
+ * further runs of the same folio are still being queued.
+ */
+static struct fuse_wb_token *fuse_wb_token_alloc(struct inode *inode,
+						 struct folio *folio)
+{
+	struct fuse_wb_token *token;
+
+	/* As iomap allocates the state this stands in for */
+	token = kmalloc(sizeof(*token), GFP_NOFS | __GFP_NOFAIL);
+	refcount_set(&token->refs, 1);
+	token->inode = inode;
+	token->folio = folio;
+	iomap_start_folio_write(inode, folio, 1);
+
+	return token;
+}
+
+static struct fuse_wb_token *fuse_wb_token_get(struct fuse_wb_token *token)
+{
+	refcount_inc(&token->refs);
+	return token;
+}
+
+static void fuse_wb_token_put(struct fuse_wb_token *token)
+{
+	if (token && refcount_dec_and_test(&token->refs)) {
+		iomap_finish_folio_write(token->inode, token->folio, 1);
+		kfree(token);
+	}
+}
+
+/*
+ * The folios, descs and tokens of a writeback request come from one
+ * allocation, which kfree(ap->folios) releases.
+ */
+static struct folio **fuse_wb_folios_alloc(unsigned int nfolios, gfp_t flags,
+					   struct fuse_folio_desc **descs,
+					   struct fuse_wb_token ***tokens)
+{
+	struct folio **folios;
+
+	folios = kzalloc(nfolios * (sizeof(struct folio *) +
+				    sizeof(struct fuse_folio_desc) +
+				    sizeof(struct fuse_wb_token *)), flags);
+	if (!folios)
+		return NULL;
+
+	*descs = (void *) (folios + nfolios);
+	*tokens = (void *) (*descs + nfolios);
+
+	return folios;
+}
+
 static void fuse_writepage_free(struct fuse_writepage_args *wpa)
 {
 	struct fuse_args_pages *ap = &wpa->ia.ap;
@@ -2622,7 +2697,7 @@ static void fuse_writepage_finish(struct fuse_writepage_args *wpa)
 		 * scope of the fi->lock alleviates xarray lock
 		 * contention and noticeably improves performance.
 		 */
-		iomap_finish_folio_write(inode, ap->folios[i], 1);
+		fuse_wb_token_put(wpa->tokens[i]);
 
 	wake_up(&fi->page_waitq);
 }
@@ -2770,7 +2845,8 @@ static struct fuse_writepage_args *fuse_writepage_args_alloc(void)
 	if (wpa) {
 		ap = &wpa->ia.ap;
 		ap->num_folios = 0;
-		ap->folios = fuse_folios_alloc(1, GFP_NOFS, &ap->descs);
+		ap->folios = fuse_wb_folios_alloc(1, GFP_NOFS, &ap->descs,
+						  &wpa->tokens);
 		if (!ap->folios) {
 			kfree(wpa);
 			wpa = NULL;
@@ -2795,13 +2871,15 @@ static void fuse_writepage_add_to_bucket(struct fuse_conn *fc,
 }
 
 static void fuse_writepage_args_page_fill(struct fuse_writepage_args *wpa, struct folio *folio,
-					  uint32_t folio_index, loff_t offset, unsigned len)
+					  uint32_t folio_index, loff_t offset, unsigned int len,
+					  struct fuse_wb_token *token)
 {
 	struct fuse_args_pages *ap = &wpa->ia.ap;
 
 	ap->folios[folio_index] = folio;
 	ap->descs[folio_index].offset = offset;
 	ap->descs[folio_index].length = len;
+	wpa->tokens[folio_index] = fuse_wb_token_get(token);
 }
 
 static struct fuse_writepage_args *fuse_writepage_args_setup(struct folio *folio,
@@ -2835,6 +2913,12 @@ struct fuse_fill_wb_data {
 	struct fuse_file *ff;
 	unsigned int max_folios;
 	/*
+	 * The folio currently being split into runs, and the count that
+	 * holds its writeback open until the last run has been queued.
+	 */
+	struct folio *wb_folio;
+	struct fuse_wb_token *wb_token;
+	/*
 	 * nr_bytes won't overflow since fuse_writepage_need_send() caps
 	 * wb requests to never exceed fc->max_pages (which has an upper bound
 	 * of U16_MAX).
@@ -2848,21 +2932,25 @@ static bool fuse_pages_realloc(struct fuse_fill_wb_data *data,
 	struct fuse_args_pages *ap = &data->wpa->ia.ap;
 	struct folio **folios;
 	struct fuse_folio_desc *descs;
+	struct fuse_wb_token **tokens;
 	unsigned int nfolios = min_t(unsigned int,
 				     max_t(unsigned int, data->max_folios * 2,
 					   FUSE_DEFAULT_MAX_PAGES_PER_REQ),
 				    max_pages);
 	WARN_ON(nfolios <= data->max_folios);
 
-	folios = fuse_folios_alloc(nfolios, GFP_NOFS, &descs);
+	folios = fuse_wb_folios_alloc(nfolios, GFP_NOFS, &descs, &tokens);
 	if (!folios)
 		return false;
 
 	memcpy(folios, ap->folios, sizeof(struct folio *) * ap->num_folios);
 	memcpy(descs, ap->descs, sizeof(struct fuse_folio_desc) * ap->num_folios);
+	memcpy(tokens, data->wpa->tokens,
+	       sizeof(struct fuse_wb_token *) * ap->num_folios);
 	kfree(ap->folios);
 	ap->folios = folios;
 	ap->descs = descs;
+	data->wpa->tokens = tokens;
 	data->max_folios = nfolios;
 
 	return true;
@@ -2944,9 +3032,59 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 	struct inode *inode = wpc->inode;
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	loff_t offset = offset_in_folio(folio, pos);
+	loff_t offset;
 
 	WARN_ON_ONCE(!data);
+
+	/*
+	 * A folio iomap has not asked about before: the one before it has all
+	 * of its runs queued, so let go of the bias holding its count open.
+	 */
+	if (data->wb_folio != folio) {
+		fuse_wb_token_put(data->wb_token);
+		data->wb_token = NULL;
+		data->wb_folio = folio;
+	}
+
+	/*
+	 * Under DLM the page cache can hold a partly written folio: a write
+	 * that is not page aligned dirties only its own bytes, and the rest
+	 * of the boundary page was never read in.  Send only what was
+	 * written, so the untouched remainder is not handed to the server.
+	 *
+	 * fuse_dlm_dirty_run() reports the run from @pos that is uniformly
+	 * written or uniformly not, and refuses to answer for a range not
+	 * covered by write grants throughout, where something outside its
+	 * record could have dirtied the folio.  In that case the whole
+	 * range goes, as it did before.
+	 *
+	 * A run that was not written is reported to iomap as a hole, which
+	 * skips it and, for a folio with no written run at all, ends the
+	 * folio writeback itself.  iomap calls back for the next run.
+	 */
+	if (fc->dlm && fc->writeback_cache) {
+		bool dirty;
+		size_t run = fuse_dlm_dirty_run(fi, pos, len, &dirty);
+
+		/*
+		 * wpc->iomap.type carries over from the previous run and from
+		 * the previous folio, so anything that is written has to say
+		 * so.  Left at a stale IOMAP_HOLE, iomap takes the folio for
+		 * one it never queued and ends its writeback while the write
+		 * is still in flight.
+		 */
+		wpc->iomap.type = IOMAP_MAPPED;
+
+		if (run) {
+			if (!dirty) {
+				wpc->iomap.type = IOMAP_HOLE;
+				return run;
+			}
+			len = run;
+		}
+	}
+
+	offset = offset_in_folio(folio, pos);
 
 	if (!data->ff) {
 		data->ff = fuse_write_file_get(fi);
@@ -2969,9 +3107,16 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		ap = &wpa->ia.ap;
 	}
 
-	iomap_start_folio_write(inode, folio, 1);
+	/*
+	 * The first run of this folio that is actually sent takes it into
+	 * writeback.  A folio with no run at all never gets here, and iomap
+	 * ends its writeback itself.
+	 */
+	if (!data->wb_token)
+		data->wb_token = fuse_wb_token_alloc(inode, folio);
+
 	fuse_writepage_args_page_fill(wpa, folio, ap->num_folios,
-				      offset, len);
+				      offset, len, data->wb_token);
 	data->nr_bytes += len;
 
 	ap->num_folios++;
@@ -2987,6 +3132,11 @@ static int fuse_iomap_writeback_submit(struct iomap_writepage_ctx *wpc,
 	struct fuse_fill_wb_data *data = wpc->wb_ctx;
 
 	WARN_ON_ONCE(!data);
+
+	/* No more runs are coming for the folio last seen */
+	fuse_wb_token_put(data->wb_token);
+	data->wb_token = NULL;
+	data->wb_folio = NULL;
 
 	if (data->wpa) {
 		WARN_ON(!data->wpa->ia.ap.num_folios);

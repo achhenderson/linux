@@ -677,6 +677,80 @@ out:
 }
 
 /**
+ * fuse_dlm_dirty_run - length of the uniform run starting at @pos
+ * @inode: the fuse inode
+ * @pos: byte offset to start at
+ * @len: bytes of interest from @pos
+ * @dirty: set to whether the returned run was written under a grant
+ *
+ * Walks forward from @pos while the recorded content stays the same and
+ * returns how far that run reaches, capped at @len.  Lets writeback ask
+ * which part of a folio this client actually wrote, so the untouched
+ * remainder of a boundary page is not sent to the server.
+ *
+ * Return: the run length, or 0 when the record cannot answer for
+ * [pos, pos + len).  That happens when the range is not covered by write
+ * grants throughout, in which case something outside this record may
+ * have dirtied it and the caller must write the whole range.
+ */
+size_t fuse_dlm_dirty_run(struct fuse_inode *inode, uint64_t pos, size_t len,
+			  bool *dirty)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	struct fuse_dlm_range *range;
+	uint64_t end, cur = pos;
+	bool run_dirty = false;
+	bool first = true;
+	size_t run = 0;
+
+	if (!len)
+		return 0;
+	end = pos + len - 1;
+
+	down_read(&cache->lock);
+
+	for (range = fuse_dlm_find_overlapping(cache, pos, end); range;
+	     range = fuse_page_it_iter_next(range, pos, end)) {
+		bool range_dirty;
+
+		/*
+		 * A gap, or a range held only for read: this client cannot
+		 * have written it, but nothing here proves nobody else
+		 * dirtied the folio, so refuse to answer.
+		 */
+		if (range->start > cur || range->state != FUSE_DLM_RANGE_WRITE)
+			goto unknown;
+
+		range_dirty = range->content == FUSE_DLM_CONTENT_DIRTY;
+		if (first) {
+			run_dirty = range_dirty;
+			first = false;
+		} else if (range_dirty != run_dirty) {
+			goto out;	/* the run ends where content changes */
+		}
+
+		if (range->end >= end) {
+			run = len;
+			goto out;
+		}
+
+		/* Safe: range->end < end, so this cannot wrap */
+		cur = range->end + 1;
+		run = cur - pos;
+	}
+
+	/* Ran out of ranges before reaching @end */
+unknown:
+	up_read(&cache->lock);
+	return 0;
+
+out:
+	up_read(&cache->lock);
+	*dirty = run_dirty;
+	return run;
+}
+
+/**
  * fuse_dlm_range_may_be_dirty - can [start, end] hold unwritten data
  * @inode: the fuse inode
  * @start: start page offset (inclusive)

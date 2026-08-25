@@ -112,6 +112,14 @@ void fuse_dlm_ranges_flushed(struct fuse_inode *inode, uint64_t start,
 			     uint64_t end);
 
 /*
+ * Length of the run from @pos, capped at @len, over which the recorded
+ * content does not change; @dirty says which it is.  0 means the record
+ * cannot answer and the caller must assume the whole range is dirty.
+ */
+size_t fuse_dlm_dirty_run(struct fuse_inode *inode, uint64_t pos, size_t len,
+			  bool *dirty);
+
+/*
  * Can [start, end] hold data the server has not seen?  A part of it with
  * no recorded grant counts as dirty.
  */
