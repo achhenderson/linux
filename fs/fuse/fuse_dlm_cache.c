@@ -552,23 +552,22 @@ void fuse_dlm_request_abort(struct fuse_inode *inode,
  *
  * Caller holds @cache->lock for write.
  *
- * Return: 0, or -ENOMEM.  A caller that cannot split must mark more than
- * it meant to, never less.
+ * Cannot fail: the split decides which bytes a caller goes on to name,
+ * and both naming more than was written and lowering more than was sent
+ * lose data.  iomap allocates the state it keeps per folio the same way.
  */
-static int fuse_dlm_split_at(struct fuse_dlm_cache *cache, uint64_t off)
+static void fuse_dlm_split_at(struct fuse_dlm_cache *cache, uint64_t off)
 {
 	struct fuse_dlm_range *range, *tail;
 
 	if (!off)
-		return 0;
+		return;
 
 	range = fuse_page_it_iter_first(&cache->ranges, off, off);
 	if (!range || range->start == off)
-		return 0;
+		return;
 
-	tail = kmalloc(sizeof(*tail), GFP_NOFS);
-	if (!tail)
-		return -ENOMEM;
+	tail = kmalloc(sizeof(*tail), GFP_NOFS | __GFP_NOFAIL);
 
 	*tail = *range;
 	INIT_LIST_HEAD(&tail->list);
@@ -582,8 +581,6 @@ static int fuse_dlm_split_at(struct fuse_dlm_cache *cache, uint64_t off)
 	range->end = off - 1;
 	fuse_page_it_insert(range, &cache->ranges);
 	fuse_page_it_insert(tail, &cache->ranges);
-
-	return 0;
 }
 
 /**
@@ -620,10 +617,6 @@ void fuse_dlm_range_touched(struct fuse_inode *inode, uint64_t start,
 
 	down_write(&cache->lock);
 
-	/*
-	 * A split that cannot allocate leaves the range whole, and the
-	 * loop below then marks more than was written.
-	 */
 	fuse_dlm_split_at(cache, start);
 	if (end < U64_MAX)
 		fuse_dlm_split_at(cache, end + 1);
@@ -634,6 +627,48 @@ void fuse_dlm_range_touched(struct fuse_inode *inode, uint64_t start,
 			range->content = level;
 
 	/* Recoalesce whatever the split left equal on both sides */
+	fuse_dlm_try_merge(cache, start, end);
+
+	up_write(&cache->lock);
+}
+
+/**
+ * fuse_dlm_range_sent - [start, end] is on its way to the server
+ * @inode: the fuse inode
+ * @start: first byte handed over (inclusive)
+ * @end: last byte handed over (inclusive)
+ *
+ * Lowers the recorded content of [start, end] back to clean.  Writeback
+ * calls this for a folio the page cache does not consider valid, where
+ * the record is the only thing saying which of its bytes are real: once
+ * they have been handed over the folio need not survive, and a later one
+ * at the same index must not be told that bytes it does not hold were
+ * written.
+ *
+ * The caller holds the folio lock, so a write dirtying the range again
+ * either came before this and is in what is being sent, or comes after
+ * and records itself.
+ */
+void fuse_dlm_range_sent(struct fuse_inode *inode, uint64_t start,
+			 uint64_t end)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	struct fuse_dlm_range *range;
+
+	if (start > end)
+		return;
+
+	down_write(&cache->lock);
+
+	fuse_dlm_split_at(cache, start);
+	if (end < U64_MAX)
+		fuse_dlm_split_at(cache, end + 1);
+
+	for (range = fuse_dlm_find_overlapping(cache, start, end); range;
+	     range = fuse_page_it_iter_next(range, start, end))
+		if (range->content == FUSE_DLM_CONTENT_DIRTY)
+			range->content = FUSE_DLM_CONTENT_CLEAN;
+
 	fuse_dlm_try_merge(cache, start, end);
 
 	up_write(&cache->lock);
@@ -1003,11 +1038,7 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 	 */
 	fuse_dlm_kill_pending(cache, start, end);
 
-	/*
-	 * Split so the revoked region has its own ranges.  A split that
-	 * cannot allocate leaves the range whole and revokes more than the
-	 * server asked for, which costs a re-request and nothing else.
-	 */
+	/* Split so the revoked region has its own ranges */
 	fuse_dlm_split_at(cache, start);
 	if (end < U64_MAX)
 		fuse_dlm_split_at(cache, end + 1);

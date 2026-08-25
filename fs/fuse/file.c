@@ -3123,8 +3123,26 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 			fallthrough;
 		case FUSE_DLM_RUN_DIRTY:
 			len = run;
+			/*
+			 * On a folio the page cache does not consider valid,
+			 * the record is the only thing saying which of its
+			 * bytes are real.  Once they are on their way the
+			 * folio need not survive, and a later one at the same
+			 * index must not be told it holds them.
+			 */
+			if (!folio_test_uptodate(folio))
+				fuse_dlm_range_sent(fi, pos, pos + len - 1);
 			break;
 		}
+	} else if (!folio_test_uptodate(folio)) {
+		/*
+		 * A folio a deferred fill left behind, reached with the
+		 * record no longer consulted because the server turned out
+		 * to have no DLM after all.  Nothing here is known to be
+		 * real, so send none of it.
+		 */
+		wpc->iomap.type = IOMAP_HOLE;
+		return len;
 	}
 
 	offset = offset_in_folio(folio, pos);

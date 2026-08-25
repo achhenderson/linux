@@ -107,6 +107,12 @@ void fuse_dlm_range_touched(struct fuse_inode *inode, uint64_t start,
 			    uint64_t end, enum fuse_page_lock_mode mode);
 
 /*
+ * [start, end] is on its way to the server: the record stops naming it.
+ */
+void fuse_dlm_range_sent(struct fuse_inode *inode, uint64_t start,
+			 uint64_t end);
+
+/*
  * Record that [start, end] holds bytes this client wrote.  Unlike
  * fuse_dlm_range_touched(), a part of it no range covers is given one.
  */
