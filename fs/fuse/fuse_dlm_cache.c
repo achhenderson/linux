@@ -83,9 +83,12 @@ enum fuse_dlm_range_content {
 struct fuse_dlm_range {
 	/* Interval tree node; only linked once granted */
 	struct rb_node rb;
-	/* Start page offset (inclusive) */
+	/*
+	 * The range, as byte offsets, both inclusive.  Grants arrive page
+	 * aligned; the content bound below is split to the exact bytes an
+	 * unaligned write covers, so these need not be.
+	 */
 	uint64_t start;
-	/* End page offset (inclusive) */
 	uint64_t end;
 	/* Subtree end value for interval tree */
 	uint64_t __subtree_end;
@@ -156,8 +159,8 @@ INTERVAL_TREE_DEFINE(struct fuse_dlm_range, rb, uint64_t, __subtree_end,
 /**
  * fuse_dlm_kill_pending - mark in-flight requests overlapping [start, end]
  * @cache: The page cache
- * @start: Start page offset of the revoked region
- * @end: End page offset of the revoked region
+ * @start: Start byte offset of the revoked region
+ * @end: End byte offset of the revoked region
  *
  * A revoke overlapping a request still on the wire has nothing to remove
  * from the tree, since that grant is not recorded yet.  Marking it makes
@@ -233,8 +236,8 @@ void fuse_dlm_cache_release_locks(struct fuse_inode *inode)
 /**
  * fuse_dlm_find_overlapping - Find a range that overlaps with [start, end]
  * @cache: The page cache
- * @start: Start page offset
- * @end: End page offset
+ * @start: Start byte offset
+ * @end: End byte offset
  *
  * Return: Pointer to the first overlapping range, or NULL if none found
  */
@@ -248,8 +251,8 @@ fuse_dlm_find_overlapping(struct fuse_dlm_cache *cache, uint64_t start,
 /**
  * fuse_page_try_merge - Try to merge ranges within a specific region
  * @cache: The page cache
- * @start: Start page offset
- * @end: End page offset
+ * @start: Start byte offset
+ * @end: End byte offset
  *
  * Attempt to merge ranges within and adjacent to the specified region
  * that have the same lock mode.
@@ -312,8 +315,8 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
 /**
  * fuse_dlm_lock_range_locked - Record a granted range of pages
  * @inode: The fuse inode
- * @start: Start page offset
- * @end: End page offset
+ * @start: Start byte offset
+ * @end: End byte offset
  * @mode: Lock mode (read or write)
  *
  * Add a locked range on the specified range of pages.
@@ -459,8 +462,8 @@ int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
  * fuse_dlm_request_begin - publish a lock request before it is sent
  * @inode: the fuse inode
  * @req: caller-owned storage for the request, live until commit or abort
- * @start: start page offset being requested (inclusive)
- * @end: end page offset being requested (inclusive)
+ * @start: start byte offset being requested (inclusive)
+ * @end: end byte offset being requested (inclusive)
  *
  * The mode is not recorded here: until the server answers the range is
  * held in neither, and the mode that reaches the tree is the one passed
@@ -500,8 +503,8 @@ void fuse_dlm_request_begin(struct fuse_inode *inode,
  * fuse_dlm_request_commit - retire a request and record its grant
  * @inode: the fuse inode
  * @req: the request published by fuse_dlm_request_begin()
- * @start: start page offset the server granted (inclusive)
- * @end: end page offset the server granted (inclusive)
+ * @start: start byte offset the server granted (inclusive)
+ * @end: end byte offset the server granted (inclusive)
  * @mode: the mode that was requested
  *
  * Unlinking @req and recording the grant are one step under the cache
@@ -593,8 +596,8 @@ static void fuse_dlm_split_at(struct fuse_dlm_cache *cache, uint64_t off)
 /**
  * fuse_dlm_range_touched - record that IO is about to reach the page cache
  * @inode: the fuse inode
- * @start: start page offset the IO covers (inclusive)
- * @end: end page offset the IO covers (inclusive)
+ * @start: start byte offset the IO covers (inclusive)
+ * @end: end byte offset the IO covers (inclusive)
  * @mode: FUSE_PAGE_LOCK_READ if the range is only being populated,
  *	FUSE_PAGE_LOCK_WRITE if it is being dirtied
  *
@@ -905,8 +908,8 @@ enum fuse_dlm_run fuse_dlm_dirty_run(struct fuse_inode *inode, uint64_t pos,
 /**
  * fuse_dlm_ranges_dropped - the page cache under [start, end] is gone
  * @inode: the fuse inode
- * @start: start page offset (inclusive)
- * @end: end page offset (inclusive)
+ * @start: start byte offset (inclusive)
+ * @end: end byte offset (inclusive)
  *
  * A revoked range exists only to describe page cache dirtied before the
  * grant was taken away.  Once that cache is gone the range has nothing
@@ -955,8 +958,8 @@ void fuse_dlm_ranges_dropped(struct fuse_inode *inode, uint64_t start,
 /**
  * fuse_dlm_range_may_be_dirty - can [start, end] hold unwritten data
  * @inode: the fuse inode
- * @start: start page offset (inclusive)
- * @end: end page offset (inclusive)
+ * @start: start byte offset (inclusive)
+ * @end: end byte offset (inclusive)
  *
  * A part of the range with no recorded grant counts as dirty, which
  * covers pages dirtied through fuse_get_page_mkwrite_lock() (no grant is
@@ -1006,8 +1009,8 @@ bool fuse_dlm_range_may_be_dirty(struct fuse_inode *inode, uint64_t start,
 /**
  * fuse_dlm_unlock_range - Revoke the grants over a range of pages
  * @inode: The fuse inode
- * @start: Start page offset
- * @end: End page offset
+ * @start: Start byte offset
+ * @end: End byte offset
  *
  * The server has taken [start, end] back.  A range that has nothing
  * cached under it is removed; one that has is kept and marked
@@ -1075,8 +1078,8 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 /**
  * __fuse_dlm_range_is_locked - walk the ranges covering [start, end]
  * @inode: The fuse inode
- * @start: Start page offset
- * @end: End page offset
+ * @start: Start byte offset
+ * @end: End byte offset
  * @mode: Lock mode to check for
  * @content_ok: if non-NULL, set to whether every covering range already
  *	records content at least as high as @mode implies, that is,
@@ -1173,8 +1176,8 @@ covered:
 /**
  * fuse_dlm_range_is_locked - Check if a page range is already locked
  * @inode: The fuse inode
- * @start: Start page offset
- * @end: End page offset
+ * @start: Start byte offset
+ * @end: End byte offset
  * @mode: Lock mode to check for
  *
  * Check if the specified range of pages is already locked.
@@ -1429,8 +1432,8 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
  * fuse_dlm_regrant_range - hold [start, end] again for writeback
  * @ff: a fuse file open for writing on @inode
  * @inode: the inode
- * @start: start page offset (inclusive)
- * @end: end page offset (inclusive)
+ * @start: start byte offset (inclusive)
+ * @end: end byte offset (inclusive)
  *
  * Writeback found bytes dirtied under a grant the server has since taken
  * away (FUSE_DLM_RUN_REVOKED).  They cannot be dropped, so take the range
