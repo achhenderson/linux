@@ -127,7 +127,8 @@ enum fuse_dlm_run {
 
 /*
  * Classify the run from @pos, setting @run to how far the answer holds,
- * capped at @len.  @run is left alone for FUSE_DLM_RUN_UNKNOWN.
+ * capped at @len.  @run is set for every query of a non-zero @len, no
+ * record included, and is never 0.
  */
 enum fuse_dlm_run fuse_dlm_dirty_run(struct fuse_inode *inode, uint64_t pos,
 				     size_t len, size_t *run);

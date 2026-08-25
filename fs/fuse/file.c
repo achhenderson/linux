@@ -2958,9 +2958,11 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		switch (fuse_dlm_dirty_run(fi, pos, len, &run)) {
 		case FUSE_DLM_RUN_UNKNOWN:
 			/*
-			 * No record for this range: send it whole, as
-			 * without DLM.
+			 * No record for this run: send it whole, as without
+			 * DLM.  Only this run, since the record may well
+			 * describe what follows it.
 			 */
+			len = run;
 			break;
 		case FUSE_DLM_RUN_CLEAN:
 			/*

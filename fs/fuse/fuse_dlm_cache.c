@@ -709,35 +709,65 @@ static enum fuse_dlm_run fuse_dlm_classify(struct fuse_dlm_range *range)
 }
 
 /**
+ * fuse_dlm_kind_at - how the byte at @cur classifies, and how far that holds
+ * @cache: the page cache
+ * @cur: byte offset to classify
+ * @end: last byte of interest
+ * @last: set to the last byte the answer covers
+ *
+ * A gap in the record, or a range held only for read, is
+ * %FUSE_DLM_RUN_UNKNOWN: this client cannot have written it.  Either way
+ * @last says how far to look next, so no caller has to rediscover it.
+ *
+ * Caller holds @cache->lock.
+ */
+static enum fuse_dlm_run fuse_dlm_kind_at(struct fuse_dlm_cache *cache,
+					  uint64_t cur, uint64_t end,
+					  uint64_t *last)
+{
+	struct fuse_dlm_range *range;
+
+	range = fuse_page_it_iter_first(&cache->ranges, cur, end);
+	if (!range || range->start > cur) {
+		/* Nothing recorded up to the next range, or to @end */
+		*last = range ? range->start - 1 : end;
+		return FUSE_DLM_RUN_UNKNOWN;
+	}
+
+	*last = min(range->end, end);
+	if (range->state == FUSE_DLM_RANGE_READ)
+		return FUSE_DLM_RUN_UNKNOWN;
+
+	return fuse_dlm_classify(range);
+}
+
+/**
  * fuse_dlm_dirty_run - classify the run starting at @pos
  * @inode: the fuse inode
  * @pos: byte offset to start at
  * @len: bytes of interest from @pos
  * @run: set to how far the classification holds, capped at @len
  *
- * Walks forward from @pos while the classification stays the same, so
- * writeback can ask what to do with one run of a folio at a time.
+ * Walks forward from @pos while the classification stays the same, so a
+ * caller can ask what to do with one run of a folio at a time.
  *
  * Return:
- * %FUSE_DLM_RUN_UNKNOWN - no record for [pos, pos + len): either a gap,
- *	or a range held only for read, which this client cannot have
- *	written but which does not rule out someone else having dirtied
- *	the folio.  @run is not set; the caller writes the whole range.
+ * %FUSE_DLM_RUN_UNKNOWN - no record for the run: either a gap, or a range
+ *\theld only for read, which this client cannot have written.
  * %FUSE_DLM_RUN_CLEAN - nothing was written here.
  * %FUSE_DLM_RUN_DIRTY - written under a grant this client still holds.
  * %FUSE_DLM_RUN_REVOKED - written, but the grant has since been taken
- *	away.  The bytes are real and must not be lost, so the caller has
- *	to hold the range again before sending them.
+ *\taway.  The bytes are real and must not be lost, so a caller sending
+ *\tthem has to hold the range again first.
+ *
+ * @run is set for every return except a zero @len, and is never 0.
  */
 enum fuse_dlm_run fuse_dlm_dirty_run(struct fuse_inode *inode, uint64_t pos,
 				     size_t len, size_t *run)
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
-	enum fuse_dlm_run kind = FUSE_DLM_RUN_UNKNOWN;
-	struct fuse_dlm_range *range;
-	uint64_t end, cur = pos;
-	bool first = true;
-	size_t reach = 0;
+	enum fuse_dlm_run kind;
+	uint64_t end, reach;
 
 	if (!len)
 		return FUSE_DLM_RUN_UNKNOWN;
@@ -745,44 +775,21 @@ enum fuse_dlm_run fuse_dlm_dirty_run(struct fuse_inode *inode, uint64_t pos,
 
 	down_read(&cache->lock);
 
-	for (range = fuse_dlm_find_overlapping(cache, pos, end); range;
-	     range = fuse_page_it_iter_next(range, pos, end)) {
-		enum fuse_dlm_run range_kind;
+	kind = fuse_dlm_kind_at(cache, pos, end, &reach);
+	while (reach < end) {
+		enum fuse_dlm_run next;
+		uint64_t last;
 
-		/*
-		 * A gap, or a range held only for read: this client cannot
-		 * have written it, and nothing here proves nobody else
-		 * dirtied the folio, so refuse to answer.
-		 */
-		if (range->start > cur || range->state == FUSE_DLM_RANGE_READ)
-			goto unknown;
-
-		range_kind = fuse_dlm_classify(range);
-		if (first) {
-			kind = range_kind;
-			first = false;
-		} else if (range_kind != kind) {
-			goto out;	/* the run ends where the answer does */
-		}
-
-		if (range->end >= end) {
-			reach = len;
-			goto out;
-		}
-
-		/* Safe: range->end < end, so this cannot wrap */
-		cur = range->end + 1;
-		reach = cur - pos;
+		/* Safe: reach < end, so this cannot wrap */
+		next = fuse_dlm_kind_at(cache, reach + 1, end, &last);
+		if (next != kind)
+			break;
+		reach = last;
 	}
 
-	/* Ran out of ranges before reaching @end */
-unknown:
 	up_read(&cache->lock);
-	return FUSE_DLM_RUN_UNKNOWN;
 
-out:
-	up_read(&cache->lock);
-	*run = reach;
+	*run = reach - pos + 1;
 	return kind;
 }
 
