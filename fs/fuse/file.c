@@ -2094,9 +2094,19 @@ retry:
 			}
 			spin_unlock(&fi->lock);
 
-			/* Zero the tail of the folio straddling the old EOF. */
-			if (extended && orig_size < pos)
+			/*
+			 * Zero the tail of the folio straddling the old EOF.
+			 * That dirties it without going through the write
+			 * below, so raise the record first or it would keep
+			 * calling that page clean.
+			 */
+			if (extended && orig_size < pos) {
+				if (fc->dlm)
+					fuse_dlm_range_touched(fi, orig_size,
+							       pos - 1,
+							       FUSE_PAGE_LOCK_WRITE);
 				pagecache_isize_extended(inode, orig_size, pos);
+			}
 		}
 
 		/*
