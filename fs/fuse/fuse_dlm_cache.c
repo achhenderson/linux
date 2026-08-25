@@ -24,6 +24,11 @@
  *
  * In-flight requests are kept off the tree so the state is consulted
  * only where a request is retired, not by every tree walker.
+ *
+ * A granted range also records what the page cache under it may hold
+ * (enum fuse_dlm_range_content).  That is an upper bound: lowering it
+ * while data is still dirty would let a revoke drop unwritten data, so
+ * only fuse_dlm_ranges_flushed() lowers it.
  */
 #include "fuse_i.h"
 #include "fuse_dlm_cache.h"
@@ -46,6 +51,19 @@ enum fuse_dlm_range_state {
 	FUSE_DLM_RANGE_WRITE,
 };
 
+/*
+ * What the page cache under a granted range may hold.  Ordered so that
+ * raising the bound is a max(); only fuse_dlm_ranges_flushed() lowers it.
+ */
+enum fuse_dlm_range_content {
+	/* Nothing cached under this grant */
+	FUSE_DLM_CONTENT_EMPTY,
+	/* May hold data the server has already seen */
+	FUSE_DLM_CONTENT_CLEAN,
+	/* May hold data the server has not seen */
+	FUSE_DLM_CONTENT_DIRTY,
+};
+
 /* A range of pages with a lock */
 struct fuse_dlm_range {
 	/* Interval tree node; only linked once granted */
@@ -58,6 +76,8 @@ struct fuse_dlm_range {
 	uint64_t __subtree_end;
 	/* Lifecycle and, once granted, the mode; see the enum above */
 	enum fuse_dlm_range_state state;
+	/* Upper bound on the page cache under this range; see the enum */
+	enum fuse_dlm_range_content content;
 	/* Temporary list entry for operations, and the cache->pending link */
 	struct list_head list;
 };
@@ -232,8 +252,14 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
 					struct fuse_dlm_range, rb);
 		}
 
-		/* Try to merge with next range if adjacent and same state */
+		/*
+		 * Merge only neighbours agreeing on both state and content:
+		 * a coalesced range carries one content bound for all of
+		 * itself, so merging across a content boundary would lose
+		 * where that bound actually applies.
+		 */
 		if (next && range->state == next->state &&
+		    range->content == next->content &&
 		    range->end + 1 == next->start) {
 			/* Merge ranges: re-insert so __subtree_end is updated */
 			fuse_page_it_remove(next, &cache->ranges);
@@ -316,6 +342,7 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 			new_range->start = current_start;
 			new_range->end = range->start - 1;
 			new_range->state = want;
+			new_range->content = FUSE_DLM_CONTENT_EMPTY;
 			INIT_LIST_HEAD(&new_range->list);
 
 			list_add_tail(&new_range->list, &to_lock);
@@ -342,6 +369,7 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 		new_range->start = current_start;
 		new_range->end = end;
 		new_range->state = want;
+		new_range->content = FUSE_DLM_CONTENT_EMPTY;
 		INIT_LIST_HEAD(&new_range->list);
 
 		list_add_tail(&new_range->list, &to_lock);
@@ -430,6 +458,8 @@ void fuse_dlm_request_begin(struct fuse_inode *inode,
 	req->start = start;
 	req->end = end;
 	req->state = FUSE_DLM_RANGE_REQUESTED;
+	/* Nothing reads this while the request is pending; publish it set */
+	req->content = FUSE_DLM_CONTENT_EMPTY;
 
 	down_write(&cache->lock);
 	list_add_tail(&req->list, &cache->pending);
@@ -486,6 +516,142 @@ void fuse_dlm_request_abort(struct fuse_inode *inode,
 	down_write(&cache->lock);
 	list_del(&req->list);
 	up_write(&cache->lock);
+}
+
+/**
+ * fuse_dlm_range_touched - record that IO is about to reach the page cache
+ * @inode: the fuse inode
+ * @start: start page offset the IO covers (inclusive)
+ * @end: end page offset the IO covers (inclusive)
+ * @mode: FUSE_PAGE_LOCK_READ if the range is only being populated,
+ *	FUSE_PAGE_LOCK_WRITE if it is being dirtied
+ *
+ * Raises the content bound of every granted range overlapping
+ * [start, end], never lowers one.
+ *
+ * Called from fuse_get_dlm_lock() and fuse_get_page_mkwrite_lock(), the
+ * two points that authorise cached IO under DLM, rather than from the
+ * page cache: no cached IO reaches a folio without passing one of them,
+ * so the bound is raised before the data lands.
+ *
+ * The bound is per tree node, and a node can be wider than the IO (the
+ * server may grant more than was asked for, and grants merge), so a 4K
+ * write marks whatever node covers it.
+ */
+void fuse_dlm_range_touched(struct fuse_inode *inode, uint64_t start,
+			    uint64_t end, enum fuse_page_lock_mode mode)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	enum fuse_dlm_range_content level;
+	struct fuse_dlm_range *range;
+
+	if (start > end)
+		return;
+
+	level = mode == FUSE_PAGE_LOCK_WRITE ? FUSE_DLM_CONTENT_DIRTY :
+					       FUSE_DLM_CONTENT_CLEAN;
+
+	down_write(&cache->lock);
+	for (range = fuse_dlm_find_overlapping(cache, start, end); range;
+	     range = fuse_page_it_iter_next(range, start, end))
+		if (range->content < level)
+			range->content = level;
+	up_write(&cache->lock);
+}
+
+/**
+ * fuse_dlm_ranges_flushed - [start, end] of the page cache is on the server
+ * @inode: the fuse inode
+ * @start: start byte offset written back and waited out (inclusive)
+ * @end: end byte offset written back and waited out (inclusive)
+ *
+ * Moves ranges lying wholly inside [start, end] back to clean.  This is
+ * the one transition that lowers the bound, so nothing may be dirtying
+ * the mapping while it runs:
+ *
+ *  - A cached write holds i_rwsem, which the caller holds exclusive.
+ *
+ *  - A fault does not, so bail out if the inode is mapped.  The test is
+ *    made under the cache lock, and a fault can only dirty a folio after
+ *    fuse_get_page_mkwrite_lock() has taken that same lock, so a mapping
+ *    created after the test cannot get past this.
+ *
+ * A range only partly inside [start, end] keeps its bound: the rest of
+ * it was not written back.
+ */
+void fuse_dlm_ranges_flushed(struct fuse_inode *inode, uint64_t start,
+			     uint64_t end)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	struct fuse_dlm_range *range;
+
+	if (start > end)
+		return;
+
+	down_write(&cache->lock);
+
+	if (mapping_mapped(inode->inode.i_mapping))
+		goto out;
+
+	for (range = fuse_dlm_find_overlapping(cache, start, end); range;
+	     range = fuse_page_it_iter_next(range, start, end))
+		if (range->start >= start && range->end <= end &&
+		    range->content == FUSE_DLM_CONTENT_DIRTY)
+			range->content = FUSE_DLM_CONTENT_CLEAN;
+
+out:
+	up_write(&cache->lock);
+}
+
+/**
+ * fuse_dlm_range_may_be_dirty - can [start, end] hold unwritten data
+ * @inode: the fuse inode
+ * @start: start page offset (inclusive)
+ * @end: end page offset (inclusive)
+ *
+ * A part of the range with no recorded grant counts as dirty, which
+ * covers pages dirtied through fuse_get_page_mkwrite_lock() (no grant is
+ * recorded there) and grants that failed to record.
+ *
+ * Return: false only when every page of [start, end] is covered by a
+ * grant not written under since it was last flushed.
+ */
+bool fuse_dlm_range_may_be_dirty(struct fuse_inode *inode, uint64_t start,
+				 uint64_t end)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	struct fuse_dlm_range *range;
+	uint64_t current_start = start;
+	bool covered_to_end = false;
+	bool dirty = false;
+
+	if (!cache || start > end)
+		return true;
+
+	down_read(&cache->lock);
+
+	for (range = fuse_dlm_find_overlapping(cache, start, end); range;
+	     range = fuse_page_it_iter_next(range, start, end)) {
+		/* A gap before this range: nothing is recorded for it */
+		if (current_start < range->start ||
+		    range->content == FUSE_DLM_CONTENT_DIRTY) {
+			dirty = true;
+			break;
+		}
+
+		if (range->end >= end) {
+			covered_to_end = true;
+			break;
+		}
+
+		/* Safe: range->end < end, so this cannot wrap */
+		current_start = range->end + 1;
+	}
+
+	up_read(&cache->lock);
+
+	/* A gap at the tail counts the same as one in the middle */
+	return dirty || !covered_to_end;
 }
 
 /**
@@ -789,11 +955,20 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	struct fuse_dlm_lock_in inarg;
 	struct fuse_dlm_lock_out outarg;
 	struct fuse_dlm_range req;
+	uint64_t pg_start, pg_end;
 	int err;
 
 	/* An empty range needs no lock. */
 	if (!length)
 		return 0;
+
+	/*
+	 * note that the offset and length don't have to be page aligned
+	 * here but since we only get here on writeback caching we will
+	 * send out page aligned requests
+	 */
+	pg_start = (uint64_t)offset & PAGE_MASK;
+	pg_end = ((uint64_t)offset + length - 1) | (PAGE_SIZE - 1);
 
 restart:
 	/* note that this can be run from different processes
@@ -803,17 +978,17 @@ restart:
 	 * The early exit uses the same helper the callers re-validate
 	 * with, so this check and a later fuse_dlm_lock_is_held() can
 	 * never disagree about what counts as covered. */
-	if (fuse_dlm_lock_is_held(fi, offset, length, mode))
-		return 0; /* we already have this area locked */
+	if (fuse_dlm_lock_is_held(fi, offset, length, mode)) {
+		/* we already have this area locked */
+		fuse_dlm_range_touched(fi, pg_start, pg_end, mode);
+		return 0;
+	}
 
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
 
-	/* note that the offset and length don't have to be page aligned
-	 * here but since we only get here on writeback caching we will
-	 * send out page aligned requests */
-	inarg.start = offset & PAGE_MASK;
-	inarg.end = (offset + length - 1) | (PAGE_SIZE - 1);
+	inarg.start = pg_start;
+	inarg.end = pg_end;
 	inarg.type = (mode == FUSE_PAGE_LOCK_WRITE) ?
 		FUSE_DLM_LOCK_WRITE : FUSE_DLM_LOCK_READ;
 
@@ -861,6 +1036,13 @@ restart:
 		 */
 		goto restart;
 	}
+
+	/*
+	 * Raise the content bound before the caller touches the page
+	 * cache.  A grant that failed to record has no range to raise;
+	 * fuse_dlm_range_may_be_dirty() reports it dirty anyway.
+	 */
+	fuse_dlm_range_touched(fi, pg_start, pg_end, mode);
 
 	/*
 	 * A failure to record (small-allocation -ENOMEM) does not undo

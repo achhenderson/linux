@@ -97,6 +97,27 @@ bool fuse_dlm_lock_is_held(struct fuse_inode *inode, loff_t offset,
 /* Is any part of the file held for write? */
 bool fuse_dlm_write_grant_exists(struct fuse_inode *inode);
 
+/*
+ * Record that cached IO in @mode is about to reach the page cache over
+ * [start, end].  Only raises the recorded content, never lowers it.
+ */
+void fuse_dlm_range_touched(struct fuse_inode *inode, uint64_t start,
+			    uint64_t end, enum fuse_page_lock_mode mode);
+
+/*
+ * [start, end] has been written back and waited out.  Caller holds
+ * i_rwsem exclusive; a mapped inode is left alone.
+ */
+void fuse_dlm_ranges_flushed(struct fuse_inode *inode, uint64_t start,
+			     uint64_t end);
+
+/*
+ * Can [start, end] hold data the server has not seen?  A part of it with
+ * no recorded grant counts as dirty.
+ */
+bool fuse_dlm_range_may_be_dirty(struct fuse_inode *inode, uint64_t start,
+				 uint64_t end);
+
 /* This is the interface to the filesystem */
 int fuse_get_dlm_lock(struct file *file, loff_t offset,
 		      size_t length, enum fuse_page_lock_mode mode);

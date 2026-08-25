@@ -683,6 +683,14 @@ static int fuse_fsync(struct file *file, loff_t start, loff_t end,
 	if (err)
 		goto out;
 
+	/*
+	 * [start, end] is on the server now, so the DLM ranges inside it
+	 * go back to clean.  i_rwsem is held exclusive here, which keeps a
+	 * cached write from dirtying them again first.
+	 */
+	if (fc->dlm && fc->writeback_cache)
+		fuse_dlm_ranges_flushed(get_fuse_inode(inode), start, end);
+
 	err = sync_inode_metadata(inode, 1);
 	if (err)
 		goto out;
@@ -3093,6 +3101,16 @@ static int fuse_get_page_mkwrite_lock(struct file *file, loff_t offset, size_t l
 		fuse_abort_conn(fc);
 		err = -EINVAL;
 	}
+
+	/*
+	 * The fault is about to dirty this page.  This grant is not
+	 * recorded, so raise the bound on whatever range covers the page;
+	 * a page outside every range already reports dirty.
+	 */
+	if (!err && fc->dlm)
+		fuse_dlm_range_touched(get_fuse_inode(inode), inarg.start,
+				       inarg.end, FUSE_PAGE_LOCK_WRITE);
+
 	return err;
 }
 /*
