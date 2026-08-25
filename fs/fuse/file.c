@@ -2188,6 +2188,17 @@ retry:
 		}
 
 		/*
+		 * Mark the exact bytes about to be dirtied, before they
+		 * are.  The DLM grant covering them is page aligned and
+		 * this is not; that difference is the record of which part
+		 * of a boundary page this client actually wrote.  A short
+		 * write leaves the unreached tail marked, which overstates.
+		 */
+		if (fc->dlm)
+			fuse_dlm_range_touched(fi, pos, end - 1,
+					       FUSE_PAGE_LOCK_WRITE);
+
+		/*
 		 * Under DLM the unaligned edges go through to the server
 		 * instead of being completed by a read-modify-write READ
 		 * (see fuse_dlm_buffered_write()); only whole pages are

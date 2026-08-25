@@ -519,6 +519,51 @@ void fuse_dlm_request_abort(struct fuse_inode *inode,
 }
 
 /**
+ * fuse_dlm_split_at - make @off start a range
+ * @cache: The page cache
+ * @off: byte offset to split at
+ *
+ * Splits the range containing @off in two, both halves keeping the state
+ * and content of the original, so a later marking can apply to one side
+ * only.  A no-op when @off already starts a range or falls in a gap.
+ *
+ * Caller holds @cache->lock for write.
+ *
+ * Return: 0, or -ENOMEM.  A caller that cannot split must mark more than
+ * it meant to, never less.
+ */
+static int fuse_dlm_split_at(struct fuse_dlm_cache *cache, uint64_t off)
+{
+	struct fuse_dlm_range *range, *tail;
+
+	if (!off)
+		return 0;
+
+	range = fuse_page_it_iter_first(&cache->ranges, off, off);
+	if (!range || range->start == off)
+		return 0;
+
+	tail = kmalloc(sizeof(*tail), GFP_KERNEL);
+	if (!tail)
+		return -ENOMEM;
+
+	*tail = *range;
+	INIT_LIST_HEAD(&tail->list);
+	tail->start = off;
+
+	/*
+	 * Bounds are never edited in place: the interval tree caches a
+	 * subtree end that only insertion recomputes.
+	 */
+	fuse_page_it_remove(range, &cache->ranges);
+	range->end = off - 1;
+	fuse_page_it_insert(range, &cache->ranges);
+	fuse_page_it_insert(tail, &cache->ranges);
+
+	return 0;
+}
+
+/**
  * fuse_dlm_range_touched - record that IO is about to reach the page cache
  * @inode: the fuse inode
  * @start: start page offset the IO covers (inclusive)
@@ -526,17 +571,17 @@ void fuse_dlm_request_abort(struct fuse_inode *inode,
  * @mode: FUSE_PAGE_LOCK_READ if the range is only being populated,
  *	FUSE_PAGE_LOCK_WRITE if it is being dirtied
  *
- * Raises the content bound of every granted range overlapping
- * [start, end], never lowers one.
+ * Raises the content bound over exactly [start, end], never lowers it.
+ * Grants are page aligned but a write need not be, so ranges are split
+ * at both ends first and only the covered part is marked; the untouched
+ * remainder of a boundary page keeps its own bound and stays out of
+ * writeback.  If a split cannot be allocated the whole overlapping range
+ * is marked, which overstates rather than understates.
  *
- * Called from fuse_get_dlm_lock() and fuse_get_page_mkwrite_lock(), the
- * two points that authorise cached IO under DLM, rather than from the
- * page cache: no cached IO reaches a folio without passing one of them,
- * so the bound is raised before the data lands.
- *
- * The bound is per tree node, and a node can be wider than the IO (the
- * server may grant more than was asked for, and grants merge), so a 4K
- * write marks whatever node covers it.
+ * Called from fuse_get_dlm_lock(), fuse_cache_write_iter() and
+ * fuse_get_page_mkwrite_lock(), which between them cover every way
+ * cached IO reaches a folio under DLM, so the bound is raised before the
+ * data lands.
  */
 void fuse_dlm_range_touched(struct fuse_inode *inode, uint64_t start,
 			    uint64_t end, enum fuse_page_lock_mode mode)
@@ -552,11 +597,39 @@ void fuse_dlm_range_touched(struct fuse_inode *inode, uint64_t start,
 					       FUSE_DLM_CONTENT_CLEAN;
 
 	down_write(&cache->lock);
+
+	/*
+	 * A split that cannot allocate leaves the range whole, and the
+	 * loop below then marks more than was written.
+	 */
+	fuse_dlm_split_at(cache, start);
+	if (end < U64_MAX)
+		fuse_dlm_split_at(cache, end + 1);
+
 	for (range = fuse_dlm_find_overlapping(cache, start, end); range;
 	     range = fuse_page_it_iter_next(range, start, end))
 		if (range->content < level)
 			range->content = level;
+
+	/* Recoalesce whatever the split left equal on both sides */
+	fuse_dlm_try_merge(cache, start, end);
+
 	up_write(&cache->lock);
+}
+
+/*
+ * Marking done by fuse_get_dlm_lock() itself.  A read populates whole
+ * pages, so the page aligned request range is the right thing to mark.
+ * A write grant is not marked here: the request range is page aligned
+ * and the write inside it need not be, and marking the alignment would
+ * claim bytes the writer never touched.  fuse_cache_write_iter() marks
+ * the exact range instead, before it writes.
+ */
+static void fuse_dlm_mark_populated(struct fuse_inode *inode, uint64_t start,
+				    uint64_t end, enum fuse_page_lock_mode mode)
+{
+	if (mode == FUSE_PAGE_LOCK_READ)
+		fuse_dlm_range_touched(inode, start, end, mode);
 }
 
 /**
@@ -980,7 +1053,7 @@ restart:
 	 * never disagree about what counts as covered. */
 	if (fuse_dlm_lock_is_held(fi, offset, length, mode)) {
 		/* we already have this area locked */
-		fuse_dlm_range_touched(fi, pg_start, pg_end, mode);
+		fuse_dlm_mark_populated(fi, pg_start, pg_end, mode);
 		return 0;
 	}
 
@@ -1042,7 +1115,7 @@ restart:
 	 * cache.  A grant that failed to record has no range to raise;
 	 * fuse_dlm_range_may_be_dirty() reports it dirty anyway.
 	 */
-	fuse_dlm_range_touched(fi, pg_start, pg_end, mode);
+	fuse_dlm_mark_populated(fi, pg_start, pg_end, mode);
 
 	/*
 	 * A failure to record (small-allocation -ENOMEM) does not undo
