@@ -362,7 +362,7 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 
 		/* If there's a gap before this range, we need to add the missing range */
 		if (current_start < range->start) {
-			new_range = kmalloc(sizeof(*new_range), GFP_KERNEL);
+			new_range = kmalloc(sizeof(*new_range), GFP_NOFS);
 			if (!new_range) {
 				ret = -ENOMEM;
 				goto out_free;
@@ -389,7 +389,7 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 
 	/* If there's a gap after the last range to the end, extend the range */
 	if (!covered_to_end && current_start <= end) {
-		new_range = kmalloc(sizeof(*new_range), GFP_KERNEL);
+		new_range = kmalloc(sizeof(*new_range), GFP_NOFS);
 		if (!new_range) {
 			ret = -ENOMEM;
 			goto out_free;
@@ -566,7 +566,7 @@ static int fuse_dlm_split_at(struct fuse_dlm_cache *cache, uint64_t off)
 	if (!range || range->start == off)
 		return 0;
 
-	tail = kmalloc(sizeof(*tail), GFP_KERNEL);
+	tail = kmalloc(sizeof(*tail), GFP_NOFS);
 	if (!tail)
 		return -ENOMEM;
 
@@ -634,6 +634,73 @@ void fuse_dlm_range_touched(struct fuse_inode *inode, uint64_t start,
 			range->content = level;
 
 	/* Recoalesce whatever the split left equal on both sides */
+	fuse_dlm_try_merge(cache, start, end);
+
+	up_write(&cache->lock);
+}
+
+/**
+ * fuse_dlm_range_written - record that [start, end] holds written bytes
+ * @inode: the fuse inode
+ * @start: first byte written (inclusive)
+ * @end: last byte written (inclusive)
+ *
+ * fuse_dlm_range_touched() in write mode, except that a part of
+ * [start, end] no range covers is given one instead of going
+ * unrecorded.  The write happened under a grant; if nothing covers those
+ * bytes by the time they are recorded, the grant was taken away in
+ * between, which is what FUSE_DLM_RANGE_REVOKED says: the bytes are
+ * real, the grant is gone, and writeback has to hold the range again
+ * before sending them.  Left unrecorded they would read as never
+ * written, and writeback would drop them.
+ */
+void fuse_dlm_range_written(struct fuse_inode *inode, uint64_t start,
+			    uint64_t end)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	struct fuse_dlm_range *range, *fill;
+	uint64_t cur = start;
+
+	if (start > end)
+		return;
+
+	down_write(&cache->lock);
+
+	fuse_dlm_split_at(cache, start);
+	if (end < U64_MAX)
+		fuse_dlm_split_at(cache, end + 1);
+
+	while (cur <= end) {
+		uint64_t reach;
+
+		range = fuse_page_it_iter_first(&cache->ranges, cur, end);
+		if (!range || range->start > cur) {
+			reach = range ? range->start - 1 : end;
+
+			/*
+			 * Losing this would lose the bytes, so it cannot be
+			 * allowed to fail; iomap allocates the state it keeps
+			 * per folio the same way.
+			 */
+			fill = kmalloc(sizeof(*fill),
+				       GFP_NOFS | __GFP_NOFAIL);
+			fill->start = cur;
+			fill->end = reach;
+			fill->state = FUSE_DLM_RANGE_REVOKED;
+			fill->content = FUSE_DLM_CONTENT_DIRTY;
+			INIT_LIST_HEAD(&fill->list);
+			fuse_page_it_insert(fill, &cache->ranges);
+		} else {
+			reach = min(range->end, end);
+			if (range->content < FUSE_DLM_CONTENT_DIRTY)
+				range->content = FUSE_DLM_CONTENT_DIRTY;
+		}
+
+		if (reach == end)
+			break;
+		cur = reach + 1;
+	}
+
 	fuse_dlm_try_merge(cache, start, end);
 
 	up_write(&cache->lock);

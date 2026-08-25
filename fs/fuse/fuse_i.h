@@ -695,6 +695,12 @@ struct fuse_sync_bucket {
  */
 struct fuse_dlm_retry {
 	bool retry_needed;
+	/*
+	 * Folio whose fill fuse_iomap_read_folio_range() left undone, so
+	 * fuse_iomap_put_folio() knows to take the uptodate flag back off
+	 * before anyone else can see it.
+	 */
+	struct folio *deferred;
 };
 
 /**

@@ -1071,16 +1071,84 @@ static int fuse_read_folio_range(struct file *file, struct folio *folio,
 	return 0;
 }
 
+/**
+ * fuse_read_folio_merge - fill @folio without disturbing what is written
+ * @file: file to read through
+ * @folio: the folio to fill
+ *
+ * A folio a partial write left behind holds the bytes that write copied
+ * and nothing else.  The record says where they are; only the gaps
+ * between them are the server's to fill, and reading over them would
+ * lose data the server has not seen yet.
+ *
+ * Return: 0, AOP_TRUNCATED_PAGE, or a negative error.
+ */
+static int fuse_read_folio_merge(struct file *file, struct folio *folio)
+{
+	struct inode *inode = folio->mapping->host;
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	uint64_t pos = folio_pos(folio);
+	size_t size = folio_size(folio);
+	size_t done = 0;
+
+	while (done < size) {
+		size_t run = size - done;
+		int err;
+
+		switch (fuse_dlm_dirty_run(fi, pos + done, size - done, &run)) {
+		case FUSE_DLM_RUN_DIRTY:
+		case FUSE_DLM_RUN_REVOKED:
+			/* Written here and not on the server yet: keep it */
+			break;
+		default:
+			err = fuse_read_folio_range(file, folio, done, run);
+			if (err)
+				return err;
+			break;
+		}
+
+		if (WARN_ON_ONCE(!run))
+			return -EIO;
+		done += run;
+	}
+
+	return 0;
+}
+
 static int fuse_read_folio(struct file *file, struct folio *folio)
 {
 	struct inode *inode = folio->mapping->host;
+	struct fuse_conn *fc = get_fuse_conn(inode);
 	int err;
 
 	err = -EIO;
 	if (fuse_is_bad(inode))
 		goto out;
 
-	err = fuse_do_readfolio(file, folio, 0, folio_size(folio));
+	/*
+	 * Writeback unlocks a folio as soon as it has handed it over, with
+	 * the writeback flag still on it, so this can be reached while a
+	 * FUSE_WRITE is still reading out of it.  Filling it now would
+	 * rewrite what is being sent, and past the end of the file the reply
+	 * comes back short and zeroes it.  Nothing reached here before a
+	 * partial write started leaving folios invalid, because a dirty
+	 * folio was always valid and never came this way.
+	 */
+	folio_wait_writeback(folio);
+
+	/*
+	 * Only a folio still holding what a write put in it has anything to
+	 * keep.  The record describes the inode, not one incarnation of a
+	 * folio: a clean folio was either never written through here or has
+	 * been reclaimed and allocated again since, and either way it holds
+	 * none of what the record names.  One that was merely being written
+	 * back is clean by now, and the record stopped naming those bytes
+	 * when they went, so it reads whole.
+	 */
+	if (fc->dlm && fc->writeback_cache && folio_test_dirty(folio))
+		err = fuse_read_folio_merge(file, folio);
+	else
+		err = fuse_do_readfolio(file, folio, 0, folio_size(folio));
 	if (!err)
 		folio_mark_uptodate(folio);
 
@@ -1099,6 +1167,33 @@ static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	size_t off = offset_in_folio(folio, pos);
 	int ret;
+
+	/*
+	 * Under DLM this fills nothing.  These are the bytes the write does
+	 * not cover, so they belong to the server, and writeback already
+	 * declines to send them back; fetching them buys only the right to
+	 * call the folio valid, at a round trip an expanding write spends on
+	 * a range that holds nothing, over a handle that may not even be
+	 * able to read.  Leave them alone.  fuse_iomap_put_folio() takes the
+	 * uptodate flag back off the folio, so the first reader fetches them
+	 * and nothing invents a value in the meantime.
+	 *
+	 * Only for a folio the page cache tracks in one piece.  Clearing the
+	 * uptodate flag of a folio of several blocks leaves iomap's per block
+	 * bits set behind it, and a read asks those through
+	 * ->is_partially_uptodate rather than calling ->read_folio, so it
+	 * would be served exactly the bytes this skipped.
+	 */
+	if (fc->dlm && fc->writeback_cache &&
+	    i_blocksize(inode) == folio_size(folio)) {
+		struct fuse_dlm_retry *wr;
+
+		wr = xa_load(&fc->dlm_retry_tasks, (unsigned long) current);
+		if (wr) {
+			wr->deferred = folio;
+			return 0;
+		}
+	}
 
 	ret = fuse_read_folio_range(file, folio, off, len);
 
@@ -1713,8 +1808,48 @@ static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive, bool uncached)
 	}
 }
 
+/*
+ * Called for every folio the write touched, with the folio still locked
+ * and @copied set to what actually landed in it.  Owns the unlock.
+ */
+static void fuse_iomap_put_folio(struct inode *inode, loff_t pos,
+				 unsigned int copied, struct folio *folio)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	if (fc->dlm && fc->writeback_cache) {
+		struct fuse_dlm_retry *wr;
+
+		/*
+		 * Record the bytes now that they are in the folio.  Marking
+		 * the intended range before the copy claimed what a short or
+		 * failed one never reached, and on a folio left invalid
+		 * below writeback would send exactly those bytes.
+		 */
+		if (copied)
+			fuse_dlm_range_written(fi, pos, pos + copied - 1);
+
+		/*
+		 * The fill was skipped, so outside what was just recorded
+		 * this folio holds bytes nobody wrote.  iomap called it
+		 * valid on the way in; take that back while it is still
+		 * locked, so no reader ever sees them.
+		 */
+		wr = xa_load(&fc->dlm_retry_tasks, (unsigned long) current);
+		if (wr && wr->deferred == folio) {
+			wr->deferred = NULL;
+			folio_clear_uptodate(folio);
+		}
+	}
+
+	folio_unlock(folio);
+	folio_put(folio);
+}
+
 static const struct iomap_write_ops fuse_iomap_write_ops = {
 	.read_folio_range = fuse_iomap_read_folio_range,
+	.put_folio	  = fuse_iomap_put_folio,
 };
 
 static int fuse_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
@@ -1770,6 +1905,7 @@ retry:
 	 * would re-enter with len==0 and livelock on a 0-length mapping.
 	 */
 	retry_state.retry_needed = false;
+	retry_state.deferred = NULL;
 
 	/*
 	 * Use iomap so that we can do granular uptodate reads
@@ -2018,11 +2154,12 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	/*
 	 * A NOTIFY invalidate can revoke the grant requested above between
 	 * here and the dirtying below, and nothing stops it: the bytes are
-	 * caught on the way out instead.  fuse_dlm_range_touched() records
-	 * them before they are dirtied, fuse_dlm_unlock_range() marks the
-	 * range revoked rather than forgetting it, and writeback holds the
-	 * range again before sending anything it finds marked that way.  So
-	 * a write racing a revoke costs a round trip, not coverage.
+	 * caught on the way out instead.  fuse_dlm_range_written() records
+	 * them as they land, covering the range itself if the revoke got
+	 * there first, fuse_dlm_unlock_range() marks a range revoked rather
+	 * than forgetting it, and writeback holds the range again before
+	 * sending anything it finds marked that way.  So a write racing a
+	 * revoke costs a round trip, not coverage.
 	 */
 
 	task_io_account_write(count);
@@ -2070,30 +2207,22 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 			/*
 			 * Zero the tail of the folio straddling the old EOF.
-			 * That dirties it without going through the write
-			 * below, so raise the record first or it would keep
-			 * calling that page clean.
+			 * Inert while the fuse block size is PAGE_SIZE, which
+			 * it always is, and nothing is recorded for it either
+			 * way: claiming the whole gap as written would hand
+			 * writeback bytes no one wrote.
 			 */
-			if (extended && orig_size < pos) {
-				if (fc->dlm)
-					fuse_dlm_range_touched(fi, orig_size,
-							       pos - 1,
-							       FUSE_PAGE_LOCK_WRITE);
+			if (extended && orig_size < pos)
 				pagecache_isize_extended(inode, orig_size, pos);
-			}
 		}
 
 		/*
-		 * Mark the exact bytes about to be dirtied, before they
-		 * are.  The DLM grant covering them is page aligned and
-		 * this is not; that difference is the record of which part
-		 * of a boundary page this client actually wrote.  A short
-		 * write leaves the unreached tail marked, which overstates.
+		 * The bytes are recorded in fuse_iomap_put_folio(), which is
+		 * told what each folio actually took.  The grant covering
+		 * them is page aligned and the write is not; that difference
+		 * is the record of which part of a boundary page this client
+		 * wrote.
 		 */
-		if (fc->dlm)
-			fuse_dlm_range_touched(fi, pos, end - 1,
-					       FUSE_PAGE_LOCK_WRITE);
-
 		written = fuse_writeback_write_iter(iocb, from, file);
 
 		/*
@@ -2958,10 +3087,17 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		switch (fuse_dlm_dirty_run(fi, pos, len, &run)) {
 		case FUSE_DLM_RUN_UNKNOWN:
 			/*
-			 * No record for this run: send it whole, as without
-			 * DLM.  Only this run, since the record may well
-			 * describe what follows it.
+			 * No record for this run.  Over a folio the server
+			 * filled, the bytes are its own and go back whole, as
+			 * without DLM; only this run, since the record may
+			 * well describe what follows it.  Over one a partial
+			 * write left waiting for its fill, nobody ever wrote
+			 * them, and sending them would invent content.
 			 */
+			if (!folio_test_uptodate(folio)) {
+				wpc->iomap.type = IOMAP_HOLE;
+				return run;
+			}
 			len = run;
 			break;
 		case FUSE_DLM_RUN_CLEAN:

@@ -107,6 +107,13 @@ void fuse_dlm_range_touched(struct fuse_inode *inode, uint64_t start,
 			    uint64_t end, enum fuse_page_lock_mode mode);
 
 /*
+ * Record that [start, end] holds bytes this client wrote.  Unlike
+ * fuse_dlm_range_touched(), a part of it no range covers is given one.
+ */
+void fuse_dlm_range_written(struct fuse_inode *inode, uint64_t start,
+			    uint64_t end);
+
+/*
  * [start, end] has been written back and waited out.  Caller holds
  * i_rwsem exclusive; a mapped inode is left alone.
  */
