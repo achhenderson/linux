@@ -99,6 +99,23 @@ fuse_dlm_granted_state(enum fuse_page_lock_mode mode)
 }
 
 /**
+ * fuse_dlm_touched_level - content bound cached IO in @mode establishes
+ * @mode: FUSE_PAGE_LOCK_READ if a range is only populated,
+ *	FUSE_PAGE_LOCK_WRITE if it is dirtied
+ *
+ * The level fuse_dlm_range_touched() raises a range to, and the one
+ * __fuse_dlm_range_is_locked() compares against to decide that raising
+ * it again would change nothing.  The two have to agree for that
+ * shortcut to be sound, hence the single helper.
+ */
+static inline enum fuse_dlm_range_content
+fuse_dlm_touched_level(enum fuse_page_lock_mode mode)
+{
+	return mode == FUSE_PAGE_LOCK_WRITE ? FUSE_DLM_CONTENT_DIRTY :
+					      FUSE_DLM_CONTENT_CLEAN;
+}
+
+/**
  * fuse_dlm_state_satisfies - is a range in @held usable for @want
  * @held: the state of a range recorded in the tree
  * @want: FUSE_DLM_RANGE_READ or FUSE_DLM_RANGE_WRITE
@@ -599,8 +616,7 @@ void fuse_dlm_range_touched(struct fuse_inode *inode, uint64_t start,
 	if (start > end)
 		return;
 
-	level = mode == FUSE_PAGE_LOCK_WRITE ? FUSE_DLM_CONTENT_DIRTY :
-					       FUSE_DLM_CONTENT_CLEAN;
+	level = fuse_dlm_touched_level(mode);
 
 	down_write(&cache->lock);
 
@@ -945,24 +961,36 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 }
 
 /**
- * fuse_dlm_range_is_locked - Check if a page range is already locked
- * @cache: The page cache
+ * __fuse_dlm_range_is_locked - walk the ranges covering [start, end]
+ * @inode: The fuse inode
  * @start: Start page offset
  * @end: End page offset
- * @mode: Lock mode to check for (or NULL to check for any lock)
+ * @mode: Lock mode to check for
+ * @content_ok: if non-NULL, set to whether every covering range already
+ *	records content at least as high as @mode implies, that is,
+ *	whether a fuse_dlm_range_touched() over the same range would
+ *	raise nothing.  Only meaningful when the return value is true.
  *
- * Check if the specified range of pages is already locked.
- * The entire range must be locked for this to return true.
+ * The content answer falls out of the walk that establishes coverage, so
+ * a caller that would otherwise follow up with fuse_dlm_range_touched()
+ * learns for free that it has nothing to do.  That matters on the read
+ * path: taking cache->lock for write is the one point where readers of
+ * an inode serialise against each other, and a read of a range that is
+ * already recorded as populated has no reason to take it.
  *
  * Return: true if the entire range is locked, false otherwise
  */
-bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
-			      uint64_t end, enum fuse_page_lock_mode mode)
+static bool __fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
+				       uint64_t end,
+				       enum fuse_page_lock_mode mode,
+				       bool *content_ok)
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	enum fuse_dlm_range_content level = fuse_dlm_touched_level(mode);
 	struct fuse_dlm_range *range;
 	enum fuse_dlm_range_state want;
 	uint64_t current_start = start;
+	bool marked = true;
 
 	if (!cache || start > end)
 		return false;
@@ -998,11 +1026,16 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 			return false;
 		}
 
+		/*
+		 * One range below the bound is enough to make the mark
+		 * necessary; the rest of the walk only confirms coverage.
+		 */
+		if (range->content < level)
+			marked = false;
+
 		/* Covered through the end of the requested range? */
-		if (range->end >= end) {
-			up_read(&cache->lock);
-			return true;
-		}
+		if (range->end >= end)
+			goto covered;
 
 		/* Move current_start past this range */
 		current_start = range->end + 1;
@@ -1018,8 +1051,29 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 		return false;
 	}
 
+covered:
+	if (content_ok)
+		*content_ok = marked;
 	up_read(&cache->lock);
 	return true;
+}
+
+/**
+ * fuse_dlm_range_is_locked - Check if a page range is already locked
+ * @inode: The fuse inode
+ * @start: Start page offset
+ * @end: End page offset
+ * @mode: Lock mode to check for
+ *
+ * Check if the specified range of pages is already locked.
+ * The entire range must be locked for this to return true.
+ *
+ * Return: true if the entire range is locked, false otherwise
+ */
+bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
+			      uint64_t end, enum fuse_page_lock_mode mode)
+{
+	return __fuse_dlm_range_is_locked(inode, start, end, mode, NULL);
 }
 
 /**
@@ -1059,6 +1113,33 @@ bool fuse_dlm_write_grant_exists(struct fuse_inode *fi)
 	return held;
 }
 
+/*
+ * fuse_dlm_lock_is_held() with the content bound reported alongside the
+ * coverage; see __fuse_dlm_range_is_locked() for @content_ok.
+ */
+static bool __fuse_dlm_lock_is_held(struct fuse_inode *fi, loff_t offset,
+				    size_t length,
+				    enum fuse_page_lock_mode mode,
+				    bool *content_ok)
+{
+	uint64_t end = (offset + length - 1) | (PAGE_SIZE - 1);
+
+	/*
+	 * An empty range needs no coverage.  Reporting it held keeps the
+	 * re-validating IO paths from re-requesting a lock the tree can
+	 * never show (the page-aligned end would invert below).  There is
+	 * nothing to mark either.
+	 */
+	if (!length) {
+		if (content_ok)
+			*content_ok = true;
+		return true;
+	}
+
+	return __fuse_dlm_range_is_locked(fi, offset & PAGE_MASK, end, mode,
+					  content_ok);
+}
+
 /**
  * fuse_dlm_lock_is_held - check that a byte range is covered by a granted lock
  * @fi:     the fuse inode
@@ -1073,17 +1154,7 @@ bool fuse_dlm_write_grant_exists(struct fuse_inode *fi)
 bool fuse_dlm_lock_is_held(struct fuse_inode *fi, loff_t offset,
 			   size_t length, enum fuse_page_lock_mode mode)
 {
-	uint64_t end = (offset + length - 1) | (PAGE_SIZE - 1);
-
-	/*
-	 * An empty range needs no coverage.  Reporting it held keeps the
-	 * re-validating IO paths from re-requesting a lock the tree can
-	 * never show (the page-aligned end would invert below).
-	 */
-	if (!length)
-		return true;
-
-	return fuse_dlm_range_is_locked(fi, offset & PAGE_MASK, end, mode);
+	return __fuse_dlm_lock_is_held(fi, offset, length, mode, NULL);
 }
 
 /**
@@ -1113,6 +1184,7 @@ static int __fuse_get_dlm_lock(struct fuse_file *ff, struct inode *inode,
 	struct fuse_dlm_lock_out outarg;
 	struct fuse_dlm_range req;
 	uint64_t pg_start, pg_end;
+	bool content_ok = false;
 	int err;
 
 	/* An empty range needs no lock. */
@@ -1135,9 +1207,19 @@ restart:
 	 * The early exit uses the same helper the callers re-validate
 	 * with, so this check and a later fuse_dlm_lock_is_held() can
 	 * never disagree about what counts as covered. */
-	if (fuse_dlm_lock_is_held(fi, offset, length, mode)) {
-		/* we already have this area locked */
-		fuse_dlm_mark_populated(fi, pg_start, pg_end, mode);
+	if (__fuse_dlm_lock_is_held(fi, offset, length, mode, &content_ok)) {
+		/*
+		 * We already have this area locked.  The walk that
+		 * established that also reported whether the content bound
+		 * is already high enough, so the exclusive
+		 * fuse_dlm_range_touched() behind fuse_dlm_mark_populated()
+		 * is only taken when it would actually raise something.
+		 * Re-reading a populated range is then one shared
+		 * acquisition end to end, rather than a down_write() that
+		 * serialises every reader of the inode against every other.
+		 */
+		if (!content_ok)
+			fuse_dlm_mark_populated(fi, pg_start, pg_end, mode);
 		return 0;
 	}
 
