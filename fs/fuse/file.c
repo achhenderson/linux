@@ -1019,6 +1019,58 @@ static int fuse_do_readfolio(struct file *file, struct folio *folio,
 	return 0;
 }
 
+/**
+ * fuse_read_folio_range - read part of a folio from the server
+ * @file: file to read through
+ * @folio: the folio to fill
+ * @off: offset within @folio to start at
+ * @len: bytes to read
+ *
+ * fuse_do_readfolio() cannot serve a partial folio: it asks for
+ * page_zeroing, and fuse_copy_folio() answers that by zeroing the whole
+ * folio whenever the request covers less than all of it.  Ask without it
+ * and zero exactly what the reply left short, which is the server saying
+ * the file ends there.
+ *
+ * Return: 0, AOP_TRUNCATED_PAGE, or a negative error.
+ */
+static int fuse_read_folio_range(struct file *file, struct folio *folio,
+				 size_t off, size_t len)
+{
+	struct inode *inode = folio->mapping->host;
+	struct fuse_mount *fm = get_fuse_mount(inode);
+	loff_t pos = folio_pos(folio) + off;
+	struct fuse_folio_desc desc = {
+		.offset = off,
+		.length = len,
+	};
+	struct fuse_io_args ia = {
+		.ap.args.out_pages = true,
+		.ap.num_folios = 1,
+		.ap.folios = &folio,
+		.ap.descs = &desc,
+	};
+	ssize_t res;
+
+	/* Don't overflow end offset */
+	if (pos + (desc.length - 1) == LLONG_MAX)
+		desc.length--;
+
+	fuse_read_args_fill(&ia, file, pos, desc.length, FUSE_READ);
+	res = fuse_simple_request(fm, &ia.ap.args);
+	if (res < 0) {
+		/* See fuse_do_readfolio() for why READ can return -EDEADLK */
+		if ((res == -EDEADLK || res == -EAGAIN) && fm->fc->dlm)
+			res = AOP_TRUNCATED_PAGE;
+		return res;
+	}
+
+	if (res < desc.length)
+		folio_zero_range(folio, off + res, desc.length - res);
+
+	return 0;
+}
+
 static int fuse_read_folio(struct file *file, struct folio *folio)
 {
 	struct inode *inode = folio->mapping->host;
@@ -1048,7 +1100,7 @@ static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 	size_t off = offset_in_folio(folio, pos);
 	int ret;
 
-	ret = fuse_do_readfolio(file, folio, off, len);
+	ret = fuse_read_folio_range(file, folio, off, len);
 
 	/*
 	 * TEMPORARY WORKAROUND for iomap write deadlock:
