@@ -1212,6 +1212,47 @@ static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 
 		wr = xa_load(&fc->dlm_retry_tasks, (unsigned long) current);
 		if (wr) {
+			struct fuse_inode *fi = get_fuse_inode(inode);
+			size_t done = 0;
+
+			/*
+			 * iomap marks this range uptodate on return, and the
+			 * read fast path serves uptodate folios without the
+			 * folio lock, so until fuse_iomap_put_folio() takes
+			 * the flag back a concurrent reader can copy these
+			 * bytes out.  Zero what nobody has written, so what
+			 * is briefly visible is defined rather than whatever
+			 * the allocator left in the folio.
+			 *
+			 * Only that, though.  The fill request covers the
+			 * whole not-uptodate block, not just the gap this
+			 * write leaves, so it can span bytes an earlier
+			 * partial write left dirty in this same folio.
+			 * Those are real data writeback has yet to send;
+			 * zeroing them here is how they would reach the
+			 * server as zeroes.  The record says which bytes are
+			 * which, exactly as in fuse_read_folio_merge().
+			 */
+			while (done < len) {
+				size_t run = len - done;
+
+				switch (fuse_dlm_dirty_run(fi, pos + done,
+							   len - done, &run)) {
+				case FUSE_DLM_RUN_DIRTY:
+				case FUSE_DLM_RUN_REVOKED:
+					/* Written and unsent: keep it */
+					break;
+				default:
+					folio_zero_range(folio, off + done,
+							 run);
+					break;
+				}
+
+				if (WARN_ON_ONCE(!run))
+					break;
+				done += run;
+			}
+
 			wr->deferred = folio;
 			return 0;
 		}
