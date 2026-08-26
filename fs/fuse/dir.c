@@ -2248,6 +2248,20 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		if (fc->dlm && fc->writeback_cache)
 			fuse_dlm_ranges_dropped(fi, PAGE_ALIGN(outarg.attr.size),
 						U64_MAX);
+
+		/*
+		 * invalidate_inode_pages2() emptied the mapping below the new
+		 * size too (laundering anything dirty first, so those bytes
+		 * are on the server).  Ranges left DIRTY there would make the
+		 * next partial write to the page keep and flush folio bytes
+		 * nobody wrote.  Only when the drop really emptied it: a busy
+		 * folio that survived still needs its record, and a fault
+		 * populating after the check keeps its page visible to it.
+		 */
+		if (fc->dlm && fc->writeback_cache && outarg.attr.size &&
+		    !filemap_range_has_page(mapping, 0, outarg.attr.size - 1))
+			fuse_dlm_ranges_dropped(fi, 0,
+						PAGE_ALIGN(outarg.attr.size) - 1);
 	}
 
 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
