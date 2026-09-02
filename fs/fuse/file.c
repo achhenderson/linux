@@ -2181,6 +2181,62 @@ static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len)
 	return (err < 0 && err != -ENOSYS) ? err : 0;
 }
 
+/*
+ * Start non-integrity writeback on the aligned chunks a streaming write has
+ * left behind.
+ *
+ * fuse_writepage_need_send() ends a request on the server's alignment, or
+ * on the largest write it takes, but where one starts is the flusher's
+ * choice, and nothing sends the range at all until a dirty limit or the
+ * closing flush asks for it.  Kicking a chunk as the writer leaves it puts
+ * both bounds on that same size and keeps the tail off the flush.
+ *
+ * Only a write continuing the run of the previous one counts: a single
+ * write crossing a bound says nothing about the rest of its chunk still
+ * coming.  The run is per inode rather than per handle, so a stream stays
+ * one stream across reopens and across the handles of a shared file.
+ *
+ * A hint only: nothing waits for it, and a chunk that is partly dirty or
+ * already written back sends what it has.  The run is read and written
+ * without the inode lock, which the DLM path holds shared, so writers
+ * landing on it together cost a kick, not correctness.
+ */
+static void fuse_writeback_kick_stream(struct kiocb *iocb, loff_t pos,
+				       size_t len)
+{
+	struct file *file = iocb->ki_filp;
+	struct inode *inode = file_inode(file);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	loff_t chunk, start, end;
+	bool sequential;
+
+	sequential = pos == fi->write_stream_next;
+	fi->write_stream_next = pos + (loff_t)len;
+	if (!sequential) {
+		/* First write of a run: no stream to speak of yet */
+		fi->write_stream_start = pos;
+		return;
+	}
+
+	/*
+	 * The bound a request ends on: the alignment the server asked for, or
+	 * without one the largest power of two write it takes.  fc->max_write
+	 * is at least 4096 once INIT has been answered, and only then is there
+	 * a writeback cache to dirty.
+	 */
+	chunk = fc->alignment_pages ? (loff_t)fc->alignment_pages << PAGE_SHIFT :
+				      rounddown_pow_of_two(fc->max_write);
+	start = round_down(fi->write_stream_start, chunk);
+	end = round_down(fi->write_stream_next, chunk);
+	/* No bound crossed, so nothing has been left complete */
+	if (end <= fi->write_stream_start)
+		return;
+
+	fi->write_stream_start = end;
+	filemap_fdatawrite_range_kick(file->f_mapping, start, end - 1);
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -2444,8 +2500,13 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	}
 out:
 	fuse_cache_wr_unlock(inode, exclusive);
-	if (written > 0)
+	if (written > 0) {
+		/* The buffered branch above, the only one leaving folios dirty */
+		if (writeback && !(iocb->ki_flags & IOCB_DIRECT))
+			fuse_writeback_kick_stream(iocb, iocb->ki_pos - written,
+						   written);
 		written = generic_write_sync(iocb, written);
+	}
 
 	return written ? written : err;
 }
@@ -4571,6 +4632,8 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fi->notify_stamp = jiffies;
 	fi->notify_interval_ewma = FUSE_NOTIFY_EWMA_SEED << FUSE_NOTIFY_EWMA_SHIFT;
 	atomic_set(&fi->size_extenders, 0);
+	fi->write_stream_next = 0;
+	fi->write_stream_start = 0;
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);

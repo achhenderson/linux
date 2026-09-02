@@ -291,6 +291,18 @@ struct fuse_inode {
 			 * and every writer clears it.
 			 */
 			atomic_t size_extenders;
+
+			/*
+			 * Run of contiguous buffered writes, whatever
+			 * handle they come through: write_stream_next is
+			 * where the next one has to land to continue it,
+			 * write_stream_start the first byte of the run no
+			 * writeback kick has covered.  A hint only, read
+			 * and written without a lock; see
+			 * fuse_writeback_kick_stream().
+			 */
+			loff_t write_stream_next;
+			loff_t write_stream_start;
 		};
 
 		/* readdir cache (directory only) */
