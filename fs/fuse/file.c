@@ -2174,9 +2174,51 @@ static void fuse_cache_wr_unlock(struct inode *inode, bool exclusive)
  * the caller must fail the write instead.  A granted-but-unrecorded
  * lock (positive return) is covered cluster-wide; proceed.
  */
+/*
+ * Widen a streaming write's DLM request to the server's alignment chunk.
+ *
+ * A server that grants exactly what is asked for, as redfs does, makes
+ * every write of a sequential stream a synchronous round trip: the write
+ * path stalls on it before it copies a byte, and a 64k stream pays one
+ * per 64k.  Once the writes through a handle have shown themselves
+ * sequential, ask up to the end of the alignment chunk this one lands
+ * in, so the writes that follow in that chunk find their range held.
+ *
+ * A first write says nothing about what follows and asks for itself
+ * alone, so a random writer costs a peer nothing extra.  A stream a peer
+ * contends is revoked as it is today; what is lost is one grant per
+ * chunk instead of one per write.  dlm_grant_ahead=0 turns it off.
+ */
+static bool fuse_dlm_grant_ahead = true;
+module_param_named(dlm_grant_ahead, fuse_dlm_grant_ahead, bool, 0644);
+MODULE_PARM_DESC(dlm_grant_ahead,
+		 "Ask for the whole alignment chunk once a handle streams (default: Y)");
+
+static size_t fuse_cache_wr_grant_ahead(struct file *file, loff_t pos,
+					size_t len)
+{
+	struct fuse_file *ff = file->private_data;
+	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
+	loff_t chunk, end;
+	bool sequential;
+
+	sequential = pos == ff->grant_stream_next;
+	ff->grant_stream_next = pos + (loff_t)len;
+
+	if (!sequential || !fc->alignment_pages || !fuse_dlm_grant_ahead)
+		return len;
+
+	chunk = (loff_t)fc->alignment_pages << PAGE_SHIFT;
+	end = round_up(pos + (loff_t)len, chunk);
+	return end - pos;
+}
+
 static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len)
 {
-	int err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE);
+	int err;
+
+	len = fuse_cache_wr_grant_ahead(file, pos, len);
+	err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE);
 
 	return (err < 0 && err != -ENOSYS) ? err : 0;
 }

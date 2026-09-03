@@ -444,6 +444,15 @@ struct fuse_file {
 
 	/** Has flock been performed on this file? */
 	bool flock:1;
+
+	/*
+	 * Where the next buffered write through this handle has to land
+	 * to continue the previous one; see fuse_cache_wr_grant_ahead().
+	 * Per handle rather than per inode on purpose: the ranks of a
+	 * shared-file MPI job each stream through their own handle, and
+	 * on the inode their runs would only interleave.
+	 */
+	loff_t grant_stream_next;
 };
 
 /** One input argument of a request */
