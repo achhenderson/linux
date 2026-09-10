@@ -2161,13 +2161,6 @@ static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive, bool uncached)
 }
 
 /*
- * How many times a writer confirms its grant again before giving up on
- * the range.  A pass costs a round trip only when the grant has gone,
- * which is a revoke landing between the request and the confirmation.
- */
-#define FUSE_DLM_PIN_RETRIES 16
-
-/*
  * Pin [@pos, @pos + @len) with the grant over it confirmed, so the bytes
  * can be dirtied under a lock that cannot be taken away meanwhile; see
  * fuse_dlm_pin().  @pin is the caller's storage for the pin, which it
@@ -2184,10 +2177,20 @@ static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
 	struct inode *inode = file_inode(file);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	unsigned int tries = FUSE_DLM_PIN_RETRIES;
 	int err;
 
+	/*
+	 * Confirm and request alternate until the grant is found held: a
+	 * pass costs a wait on the fence and a round trip only when a
+	 * revoke has landed between the request and the confirmation, so a
+	 * long run of passes is a storm of revokes over these bytes, and
+	 * the write waits it out rather than fail.  An EIO made up here
+	 * after some number of passes reached the application on a write
+	 * the server never refused.  A fatal signal still ends the wait.
+	 */
 	for (;;) {
+		if (fatal_signal_pending(current))
+			return -EINTR;
 		fuse_dlm_pin(fi, pin, pos, len);
 		/*
 		 * A server that turned out to have no DLM leaves nothing to
@@ -2197,9 +2200,6 @@ static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
 		    fuse_dlm_lock_is_held(fi, pos, len, FUSE_PAGE_LOCK_WRITE))
 			return 0;
 		fuse_dlm_unpin(fi);
-
-		if (!tries--)
-			return -EIO;
 
 		err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE);
 		if (err < 0 && err != -ENOSYS)

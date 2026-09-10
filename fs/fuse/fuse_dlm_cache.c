@@ -31,12 +31,6 @@
 #include <linux/xarray.h>
 
 
-/*
- * How often to ask again for a grant a revoke killed while it was in
- * flight, or the server refused as contended, before giving up on the
- * range.  Each pass is a round trip.
- */
-#define FUSE_DLM_GRANT_RETRIES 16
 
 /*
  * How far beyond the requested range a grant is recorded.
@@ -888,7 +882,6 @@ static int __fuse_get_dlm_lock(struct fuse_file *ff, struct inode *inode,
 	struct fuse_dlm_range req;
 	uint64_t pg_start, pg_end;
 	uint64_t grant_start, grant_end;
-	int tries = FUSE_DLM_GRANT_RETRIES;
 	int err;
 
 	/* An empty range needs no lock. */
@@ -1026,16 +1019,18 @@ restart:
 
 retry:
 	/*
-	 * Ask again, but not forever.  Every pass is a whole round trip,
-	 * which throttles the loop but does not end it, and writeback asks
-	 * for a grant with a folio locked, so a node taking the range as
-	 * fast as this asks for it would hold that folio and this task for
-	 * as long as it kept going.
+	 * Ask again, for as long as it takes.  Every pass is a whole round
+	 * trip, which paces the loop, and the only way out of it is the
+	 * server's: a grant that stays, or an error of its own.  An error
+	 * made up here after some number of passes reached the application
+	 * as EIO on a write that the server never refused, which is not a
+	 * report of anything but of how long a storm of revokes lasted.
+	 * Writeback no longer asks with a folio locked (it defers the run
+	 * instead), so nothing is held across the passes but this task,
+	 * which a fatal signal still ends.
 	 */
 	if (fatal_signal_pending(current))
 		return -EINTR;
-	if (!tries--)
-		return -EIO;
 	goto restart;
 }
 
