@@ -780,6 +780,10 @@ static int fuse_uring_copy_from_ring(struct fuse_req *req,
 	if (err)
 		return err;
 
+	/* fuse_copy_fill() must not run out of buffer */
+	if (!ent->zero_copied && ring_in_out.payload_sz > iov_iter_count(&iter))
+		return -EINVAL;
+
 	err = fuse_copy_out_args(&cs, args, ring_in_out.payload_sz);
 	fuse_copy_finish(&cs);
 	return err;
@@ -886,6 +890,11 @@ static int fuse_uring_args_to_ring(struct fuse_req *req,
 		in_args++;
 		num_args--;
 	}
+
+	/* fuse_copy_fill() must not run out of buffer */
+	if (!ent->zero_copied &&
+	    fuse_len_args(num_args, (struct fuse_arg *)in_args) > iov_iter_count(&iter))
+		return -E2BIG;
 
 	/* copy the payload */
 	err = fuse_copy_args(&cs, num_args, args->in_pages,
