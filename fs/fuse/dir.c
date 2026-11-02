@@ -1625,9 +1625,11 @@ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
 		goto unlock;
 
 	fuse_dir_changed(parent);
-	if (!(flags & FUSE_EXPIRE_ONLY))
+	/* fusex has no d_fsdata and doesn't revalidate, an entry can't expire */
+	if (!(flags & FUSE_EXPIRE_ONLY) || !entry->d_fsdata)
 		d_invalidate(entry);
-	fuse_invalidate_entry_cache(entry);
+	if (entry->d_fsdata)
+		fuse_invalidate_entry_cache(entry);
 
 	if (child_nodeid != 0 && d_really_is_positive(entry)) {
 		inode_lock(d_inode(entry));
@@ -1648,7 +1650,14 @@ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
 			d_inode(entry)->i_flags |= S_DEAD;
 		}
 		dont_mount(entry);
-		clear_nlink(d_inode(entry));
+		if (entry->d_fsdata) {
+			clear_nlink(d_inode(entry));
+		} else {
+			/* fusex: it can have other names, the attributes tell */
+			if (d_inode(entry)->i_nlink)
+				drop_nlink(d_inode(entry));
+			fuse_invalidate_attr(d_inode(entry));
+		}
 		err = 0;
  badentry:
 		inode_unlock(d_inode(entry));
