@@ -793,11 +793,15 @@ enum fuse_mkobjx_flags {
 	FUSE_MKOBJX_TMPFILE = 1 << 0,
 };
 
+/*
+ * Everything before @stat goes to the 128 byte op_in of
+ * struct fuse_uring_req_header.
+ */
 struct fuse_mkobjx_in {
-	struct fuse_statx stat;
 	uint32_t	namesize;
 	uint32_t	flags;
 	uint64_t	spare[7];
+	struct fuse_statx stat;
 };
 
 struct fuse_mkdir_in {

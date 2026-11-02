@@ -136,7 +136,9 @@ static int fusex_send_setstatx(struct inode *inode, struct fuse_setstatx_in *ina
 	struct fuse_statx_out outarg;
 
 	args.opcode = FUSE_SETSTATX;
-	ADD_IN_ARG_S(args, inarg);
+	/* The first arg goes to the 128 byte op_in of the ring header */
+	ADD_IN_ARG(args, offsetof(struct fuse_setstatx_in, stat), inarg);
+	ADD_IN_ARG_S(args, &inarg->stat);
 	ADD_OUT_ARG_S(args, &outarg);
 
 	return fusex_inode_request(inode, &args);
@@ -389,7 +391,6 @@ static long fusex_file_fallocate(struct file *file, int mode, loff_t offset, lof
 		return err;
 
 	args.opcode = FUSE_FALLOCATE;
-	args.in_numargs = 1;
 	ADD_IN_ARG_S(args, &inarg);
 	err = fusex_inode_request(inode, &args);
 	if (err)
@@ -980,7 +981,9 @@ static int fusex_send_mkobjx(struct inode *dir, struct inode *inode,
 	inarg.flags = flags;
 
 	args.opcode = FUSE_MKOBJX;
-	ADD_IN_ARG_S(args, &inarg);
+	/* The first arg goes to the 128 byte op_in of the ring header */
+	ADD_IN_ARG(args, offsetof(struct fuse_mkobjx_in, stat), &inarg);
+	ADD_IN_ARG_S(args, &inarg.stat);
 	ADD_IN_ARG(args, inarg.namesize, name->name);
 	if (S_ISLNK(inode->i_mode))
 		ADD_IN_ARG(args, strlen(link_body) + 1, link_body);
