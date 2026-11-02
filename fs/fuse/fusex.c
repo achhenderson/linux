@@ -1535,6 +1535,7 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 	inarg_in.flags = flags;
 	inarg_in.flags2 = flags >> 32;
 	args_in.opcode = FUSE_INIT;
+	args_in.abort_on_kill = true;
 	ADD_IN_ARG_S(args_in, &inarg_in);
 	ADD_OUT_ARG_S(args_in, &outarg_in);
 	err = fuse_simple_request(fm, &args_in);
@@ -1553,6 +1554,7 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 				  max_t(unsigned int, outarg_in.max_pages, 1));
 
 	args_lr.opcode = FUSE_LOOKUP_ROOT;
+	args_lr.abort_on_kill = true;
 	ADD_OUT_ARG_S(args_lr, &outarg_lr);
 	err = fuse_simple_request(fm, &args_lr);
 	if (err)
@@ -1564,6 +1566,7 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 
 	fusex_fill_statx(&args_sx, &inarg_sx, statx);
 	args_sx.nodeid = id->nodeid;
+	args_sx.abort_on_kill = true;
 	err = fuse_simple_request(fm, &args_sx);
 	if (err)
 		return err;
