@@ -182,6 +182,11 @@ static int fusex_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct fuse_statfs_out outarg;
 	int err;
 
+	if (!fuse_allow_current_process(get_fuse_conn(d_inode(dentry)))) {
+		buf->f_type = FUSE_SUPER_MAGIC;
+		return 0;
+	}
+
 	args.opcode = FUSE_STATFS;
 	ADD_OUT_ARG_S(args, &outarg);
 	err = fusex_inode_request(d_inode(dentry), &args);
@@ -698,6 +703,16 @@ static int fusex_getattr(struct mnt_idmap *idmap, const struct path *path, struc
 	struct inode *inode = d_inode(path->dentry);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 
+	if (!fuse_allow_current_process(get_fuse_conn(inode))) {
+		if (!request_mask) {
+			/* Asking for nothing only gets st_dev */
+			stat->result_mask = 0;
+			stat->dev = inode->i_sb->s_dev;
+			return 0;
+		}
+		return -EACCES;
+	}
+
 	generic_fillattr(idmap, request_mask, inode, stat);
 	stat->ino = fi->orig_ino;
 	stat->blksize = 1 << fi->cached_i_blkbits;
@@ -772,6 +787,10 @@ static ssize_t fusex_listxattr(struct dentry *dentry, char *list, size_t size)
 {
 	struct inode *inode = d_inode(dentry);
 	ssize_t res;
+
+	if (!fuse_allow_current_process(get_fuse_conn(inode)))
+		return -EACCES;
+
 	char *gotlist __free(kvfree) = fusex_send_listxattr(inode, &res);
 
 	if (IS_ERR(gotlist))
@@ -1158,6 +1177,9 @@ static int fusex_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct 
 	struct fuse_setstatx_in inarg;
 	int err;
 
+	if (!fuse_allow_current_process(get_fuse_conn(inode)))
+		return -EACCES;
+
 	err = setattr_prepare(idmap, dentry, iattr);
 	if (err)
 		return err;
@@ -1283,7 +1305,16 @@ static int fusex_link(struct dentry *dentry, struct inode *newdir, struct dentry
 	return 0;
 }
 
+static int fusex_permission(struct mnt_idmap *idmap, struct inode *inode, int mask)
+{
+	if (!fuse_allow_current_process(get_fuse_conn(inode)))
+		return -EACCES;
+
+	return generic_permission(idmap, inode, mask);
+}
+
 static const struct inode_operations fusex_file_inode_operations = {
+	.permission	= fusex_permission,
 	.getattr	= fusex_getattr,
 	.setattr	= fusex_setattr,
 	.get_inode_acl	= fusex_get_acl,
@@ -1292,6 +1323,7 @@ static const struct inode_operations fusex_file_inode_operations = {
 };
 
 static const struct inode_operations fusex_dir_inode_operations = {
+	.permission	= fusex_permission,
 	.getattr	= fusex_getattr,
 	.setattr	= fusex_setattr,
 	.get_inode_acl	= fusex_get_acl,
@@ -1311,6 +1343,7 @@ static const struct inode_operations fusex_dir_inode_operations = {
 };
 
 static const struct inode_operations fusex_symlink_inode_operations = {
+	.permission	= fusex_permission,
 	.getattr	= fusex_getattr,
 	.get_link	= page_get_link,
 	.listxattr	= fusex_listxattr,
@@ -1661,6 +1694,8 @@ static int fusex_get_tree(struct fs_context *fsc)
 
 	fuse_conn_init(fc, fm, fsc->user_ns, fch);
 	fc->release = fuse_free_conn;
+	/* No mount options: like virtiofs, any process in the user namespace */
+	fc->allow_other = 1;
 	fsc->s_fs_info = fm;
 	retain_and_null_ptr(fc);
 	retain_and_null_ptr(fm);
