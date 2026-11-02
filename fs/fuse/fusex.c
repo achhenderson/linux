@@ -92,10 +92,6 @@ static ssize_t fusex_inode2_request(struct inode *inode, struct inode *inode2,
 static struct inode *fusex_alloc_inode(struct super_block *sb)
 {
 	struct fuse_inode *fi;
-	struct fuse_forget_link *forget __free(kfree) = fuse_alloc_forget();
-
-	if (!forget)
-		return NULL;
 
 	fi = alloc_inode_sb(sb, fuse_inode_cachep, GFP_KERNEL);
 	if (!fi)
@@ -105,7 +101,6 @@ static struct inode *fusex_alloc_inode(struct super_block *sb)
 	BUILD_BUG_ON(offsetof(struct fuse_inode, inode) != 0);
 	memset((void *) fi + sizeof(fi->inode), 0, sizeof(*fi) - sizeof(fi->inode));
 
-	fi->forget = no_free_ptr(forget);
 	return &fi->inode;
 }
 
@@ -113,21 +108,50 @@ static void fusex_free_inode(struct inode *inode)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 
-	kfree(fi->forget);
 	kmem_cache_free(fuse_inode_cachep, fi);
+}
+
+struct fusex_forget_args {
+	struct fuse_args args;
+	struct fuse_forget_in inarg;
+};
+
+static void fusex_forget_end(struct fuse_args *args, int error)
+{
+	kfree(container_of(args, struct fusex_forget_args, args));
+}
+
+/*
+ * A normal ring request, the server commits it to get the entry back.  This can
+ * run in reclaim, on failure the server keeps the node id until unmount.
+ */
+static void fusex_send_forget(struct fuse_mount *fm, u64 nodeid)
+{
+	struct fusex_forget_args *fa = kzalloc_obj(*fa, GFP_NOFS);
+
+	if (!fa)
+		return;
+
+	fa->inarg.nlookup = 1;
+	fa->args.opcode = FUSE_FORGET;
+	fa->args.nodeid = nodeid;
+	fa->args.force = true;
+	fa->args.nocreds = true;
+	fa->args.end = fusex_forget_end;
+	ADD_IN_ARG_S(fa->args, &fa->inarg);
+
+	if (fuse_simple_background(fm, &fa->args, GFP_NOFS))
+		kfree(fa);
 }
 
 static void fusex_evict_inode(struct inode *inode)
 {
-	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
-	if (fi->forget) {
-		fuse_chan_queue_forget(fc->chan, fi->forget, fi->nodeid, 1);
-		fi->forget = NULL;
-	}
+	if (fi->nodeid)
+		fusex_send_forget(get_fuse_mount(inode), fi->nodeid);
 }
 
 static int fusex_send_setstatx(struct inode *inode, struct fuse_setstatx_in *inarg)
@@ -753,7 +777,8 @@ static void *fusex_send_lgxattr(struct inode *inode, const char *name, size_t *s
 	ssize_t res;
 
 	memset(&inarg, 0, sizeof(inarg));
-	inarg.size = name ? XATTR_SIZE_MAX : XATTR_LIST_MAX;
+	inarg.size = min_t(size_t, name ? XATTR_SIZE_MAX : XATTR_LIST_MAX,
+			   fuse_uring_max_payload(get_fuse_conn(inode)->chan));
 
 	args.opcode = name ? FUSE_GETXATTR : FUSE_LISTXATTR;
 	ADD_IN_ARG_S(args, &inarg);
@@ -1112,10 +1137,6 @@ static struct inode *fusex_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 	return inode;
 
 iput_noforget:
-	struct fuse_inode *fi = get_fuse_inode(inode);
-
-	kfree(fi->forget);
-	fi->forget = NULL;
 	iput(inode);
 	return ERR_PTR(err);
 }
@@ -1578,7 +1599,7 @@ const struct xattr_handler *const fusex_xattr_handlers[] = {
 };
 
 static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
-			   struct fuse_statx_out *statx, bool *io_uring_enabled)
+			   struct fuse_statx_out *statx)
 {
 	FUSE_ARGS(args_in);
 	FUSE_ARGS(args_lr);
@@ -1587,11 +1608,9 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 	struct fuse_init_out outarg_in;
 	struct fuse_entryx_out outarg_lr;
 	struct fuse_statx_in inarg_sx;
-	u64 flags = FUSE_INIT_EXT;
+	u64 flags = FUSE_INIT_EXT | FUSE_OVER_IO_URING;
+	size_t max_payload;
 	int err;
-
-	if (fuse_uring_enabled())
-		flags |= FUSE_OVER_IO_URING;
 
 	memset(&inarg_in, 0, sizeof(inarg_in));
 	inarg_in.major = FUSE_KERNEL_VERSION;
@@ -1611,11 +1630,19 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 		return -EINVAL;
 
 	flags |= (u64) outarg_in.flags2 << 32;
+	if (!(flags & FUSE_OVER_IO_URING))
+		return -EPROTONOSUPPORT;
+
+	/* A request has to fit the payload buffer of any ring entry */
+	max_payload = fuse_uring_max_payload(fm->fc->chan);
 
 	fm->fc->minor = outarg_in.minor;
-	fm->fc->max_write = outarg_in.max_write;
-	fm->fc->max_pages = min_t(unsigned int, fm->fc->max_pages_limit,
-				  max_t(unsigned int, outarg_in.max_pages, 1));
+	fm->fc->max_write = min_t(size_t, outarg_in.max_write, max_payload);
+	fm->fc->max_pages = min_t(size_t, max_payload >> PAGE_SHIFT,
+				  min_t(unsigned int, fm->fc->max_pages_limit,
+					max_t(unsigned int, outarg_in.max_pages, 1)));
+	if (!fm->fc->max_pages)
+		return -EINVAL;
 
 	args_lr.opcode = FUSE_LOOKUP_ROOT;
 	args_lr.abort_on_kill = true;
@@ -1638,8 +1665,6 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 	if (!S_ISDIR(statx->stat.mode) || !fuse_valid_size(statx->stat.size))
 		return -EIO;
 
-	*io_uring_enabled = flags & FUSE_OVER_IO_URING && fuse_uring_enabled();
-
 	return 0;
 }
 
@@ -1650,8 +1675,7 @@ static int fusex_fill_super(struct super_block *sb, struct fs_context *fsc)
 	struct inode *inode;
 	struct fusex_id id;
 	struct fuse_statx_out statx;
-	struct fuse_chan_param cp;
-	bool io_uring_enabled;
+	struct fuse_chan_param cp = {};
 	int err;
 
 	fm->sb = sb;
@@ -1681,7 +1705,7 @@ static int fusex_fill_super(struct super_block *sb, struct fs_context *fsc)
 	sb->s_flags &= SB_RDONLY;
 	sb->s_flags |= SB_POSIXACL;
 
-	err = fusex_send_init(fm, &id, &statx, &io_uring_enabled);
+	err = fusex_send_init(fm, &id, &statx);
 	if (err)
 		return err;
 
@@ -1703,23 +1727,28 @@ static int fusex_fill_super(struct super_block *sb, struct fs_context *fsc)
 	cp.minor = fc->minor;
 	cp.max_write = fc->max_write;
 	cp.max_pages = fc->max_pages;
-	cp.io_uring_enabled = io_uring_enabled;
 	fuse_chan_set_initialized(fc->chan, &cp);
 
 	return 0;
 }
 
-static int fusex_get_tree(struct fs_context *fsc)
+/*
+ * FUSE_INIT goes over the ring, so the server registers ring entries between
+ * setting the fd and CMD_CREATE.
+ */
+static int fusex_new_conn(struct fs_context *fsc, struct fuse_dev *fud)
 {
-	struct fuse_dev *fud = fsc->fs_private;
 	struct fuse_conn *fc __free(kfree) = kmalloc_obj(*fc);
 	struct fuse_mount *fm __free(kfree) = kzalloc_obj(*fm);
 	struct fuse_chan *fch __free(fuse_chan_free) = fuse_dev_chan_new();
+	int err;
 
-	if (!fud)
-		return invalfc(fsc, "fd not set");
 	if (!fch || !fc || !fm)
 		return -ENOMEM;
+
+	err = fuse_uring_ring_only_init(fch);
+	if (err)
+		return err;
 
 	fuse_conn_init(fc, fm, fsc->user_ns, fch);
 	fc->release = fuse_free_conn;
@@ -1728,8 +1757,15 @@ static int fusex_get_tree(struct fs_context *fsc)
 	fsc->s_fs_info = fm;
 	retain_and_null_ptr(fc);
 	retain_and_null_ptr(fm);
-	fuse_chan_set_initialized(fch, NULL);
 	fuse_dev_install(fud, no_free_ptr(fch));
+
+	return 0;
+}
+
+static int fusex_get_tree(struct fs_context *fsc)
+{
+	if (!fsc->s_fs_info)
+		return invalfc(fsc, "fd not set");
 
 	return get_tree_nodev(fsc, fusex_fill_super);
 }
@@ -1747,7 +1783,7 @@ static int fusex_parse_param(struct fs_context *fsc, struct fs_parameter *param)
 {
 	struct fs_parse_result result;
 	struct fuse_dev *fud;
-	int opt;
+	int opt, err;
 
 	if (fsc->purpose == FS_CONTEXT_FOR_RECONFIGURE)
 		return invalfc(fsc, "No changes allowed in reconfigure");
@@ -1771,6 +1807,15 @@ static int fusex_parse_param(struct fs_context *fsc, struct fs_parameter *param)
 		if (!fuse_dev_is_sync_init(fud)) {
 			fuse_dev_put(fud);
 			return invalfc(fsc, "synchronous INIT is mandatory");
+		}
+		if (fuse_dev_is_installed(fud)) {
+			fuse_dev_put(fud);
+			return invalfc(fsc, "fuse device already in use");
+		}
+		err = fusex_new_conn(fsc, fud);
+		if (err) {
+			fuse_dev_put(fud);
+			return err;
 		}
 		fsc->fs_private = fud;
 		break;

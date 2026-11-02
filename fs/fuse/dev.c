@@ -1554,6 +1554,9 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 	unsigned reqsize;
 	unsigned int hash;
 
+	if (fch->ring_only)
+		return -EOPNOTSUPP;
+
 	/*
 	 * Require sane minimum read buffer - that has capacity for fixed part
 	 * of any request header + negotiated max_write room for data.
@@ -1903,6 +1906,9 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 	struct fuse_pqueue *fpq = &fud->pq;
 	struct fuse_req *req;
 	struct fuse_out_header oh;
+
+	if (fch->ring_only)
+		return -EOPNOTSUPP;
 
 	err = -EINVAL;
 	if (nbytes < sizeof(struct fuse_out_header))

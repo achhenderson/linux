@@ -345,6 +345,33 @@ void fuse_uring_conn_init(struct fuse_chan *fch)
 		fch->io_uring = 1;
 }
 
+/*
+ * No /dev/fuse data path on this channel.  FUSE_INIT comes over the ring too, so
+ * entries are registered before max_write and max_pages are known: the first
+ * entry sets max_payload_sz.  Interrupts can only go to /dev/fuse.
+ */
+int fuse_uring_ring_only_init(struct fuse_chan *fch)
+{
+	struct fuse_ring *ring = fuse_uring_create(fch);
+
+	if (!ring)
+		return -ENOMEM;
+
+	ring->max_payload_sz = 0;
+	fch->ring_only = true;
+	fch->io_uring = 1;
+	fch->no_interrupt = true;
+	fch->iq.ops = &fuse_io_uring_ops;
+	fuse_chan_set_initialized(fch, NULL);
+
+	return 0;
+}
+
+size_t fuse_uring_max_payload(struct fuse_chan *fch)
+{
+	return fch->ring->max_payload_sz;
+}
+
 static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
 						       int qid, bool zero_copy,
 						       bool fail_if_exists)
@@ -1470,6 +1497,9 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
 			return ERR_PTR(err);
 		}
 	} else {
+		if (!queue->zero_copy)
+			cmpxchg(&ring->max_payload_sz, 0,
+				max(payload->iov_len, FUSE_MIN_READ_BUFFER));
 		if (payload->iov_len < ring->max_payload_sz) {
 			spin_unlock(&queue->lock);
 			pr_info_ratelimited("Invalid req payload len %zu\n",
@@ -1607,6 +1637,8 @@ static int fuse_uring_add_bufpool(struct io_uring_cmd *cmd,
 
 	/* each buffer holds the max payload size */
 	buf_size = queue->ring->max_payload_sz;
+	if (!buf_size)
+		return -EINVAL;
 
 	nr_bufs = pool_len / buf_size;
 	if (!nr_bufs)
@@ -1705,8 +1737,11 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		if (err) {
 			pr_info_once("FUSE_IO_URING_CMD_REGISTER failed err=%d\n",
 				     err);
-			fch->io_uring = 0;
-			wake_up_all(&fch->blocked_waitq);
+			/* Nothing to fall back to on a ring only channel */
+			if (!fch->ring_only) {
+				fch->io_uring = 0;
+				wake_up_all(&fch->blocked_waitq);
+			}
 			return err;
 		}
 		break;

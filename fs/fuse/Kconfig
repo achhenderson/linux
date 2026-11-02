@@ -76,3 +76,6 @@ config FUSE_IO_URING
 
 	  If you want to allow fuse server/client communication through io-uring,
 	  answer Y
+
+	  The fusex filesystem communicates only through io-uring and is not
+	  available without this.

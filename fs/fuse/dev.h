@@ -96,6 +96,8 @@ void fuse_copy_finish(struct fuse_copy_state *cs);
 #ifdef CONFIG_FUSE_IO_URING
 bool fuse_uring_enabled(void);
 void fuse_uring_destruct(struct fuse_chan *fch);
+int fuse_uring_ring_only_init(struct fuse_chan *fch);
+size_t fuse_uring_max_payload(struct fuse_chan *fch);
 #else /* CONFIG_FUSE_IO_URING */
 static inline bool fuse_uring_enabled(void)
 {

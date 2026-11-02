@@ -2162,9 +2162,11 @@ static int __init fuse_init(void)
 	if (res)
 		goto err_sysfs_cleanup;
 
+#ifdef CONFIG_FUSE_IO_URING
 	res = fusex_init();
 	if (res)
 		goto err_ctl_cleanup;
+#endif
 
 	fuse_dentry_tree_init();
 
@@ -2173,8 +2175,10 @@ static int __init fuse_init(void)
 
 	return 0;
 
+#ifdef CONFIG_FUSE_IO_URING
 err_ctl_cleanup:
 	fuse_ctl_cleanup();
+#endif
  err_sysfs_cleanup:
 	fuse_sysfs_cleanup();
  err_dev_cleanup:
@@ -2190,7 +2194,9 @@ static void __exit fuse_exit(void)
 	pr_debug("exit\n");
 
 	fuse_dentry_tree_cleanup();
+#ifdef CONFIG_FUSE_IO_URING
 	fusex_cleanup();
+#endif
 	fuse_ctl_cleanup();
 	fuse_sysfs_cleanup();
 	fuse_fs_cleanup();

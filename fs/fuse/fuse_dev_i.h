@@ -245,6 +245,9 @@ struct fuse_chan {
 	/** Is interrupt not implemented by fs? */
 	bool no_interrupt;
 
+	/* No /dev/fuse read and write, everything goes over the ring */
+	bool ring_only;
+
 	/* Use io_uring for communication */
 	unsigned int io_uring;
 
