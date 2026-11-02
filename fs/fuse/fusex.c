@@ -728,7 +728,7 @@ static void *fusex_send_lgxattr(struct inode *inode, const char *name, size_t *s
 
 	res = fusex_inode_request(inode, &args);
 	if (res < 0) {
-		kfree(args.out_args[0].value);
+		kvfree(args.out_args[0].value);
 		if (res == -ENOSYS)
 			res = -EOPNOTSUPP;
 		return ERR_PTR(res);
@@ -761,7 +761,7 @@ static char *fusex_send_listxattr(struct inode *inode, size_t *gotsize)
 		return list;
 
 	if (!fusex_verify_xattr_list(list, *gotsize)) {
-		kfree(list);
+		kvfree(list);
 		return ERR_PTR(-EIO);
 	}
 
@@ -772,7 +772,7 @@ static ssize_t fusex_listxattr(struct dentry *dentry, char *list, size_t size)
 {
 	struct inode *inode = d_inode(dentry);
 	ssize_t res;
-	char *gotlist __free(kfree) = fusex_send_listxattr(inode, &res);
+	char *gotlist __free(kvfree) = fusex_send_listxattr(inode, &res);
 
 	if (IS_ERR(gotlist))
 		return PTR_ERR(gotlist);
@@ -792,7 +792,7 @@ static struct posix_acl *fusex_get_acl(struct inode *inode, int type, bool rcu)
 	struct user_namespace *user_ns = i_user_ns(inode);
 	const char *name = posix_acl_xattr_name(type);
 	size_t size;
-	void *value __free(kfree) = fusex_send_lgxattr(inode, name, &size);
+	void *value __free(kvfree) = fusex_send_lgxattr(inode, name, &size);
 	struct posix_acl *acl = NULL;
 
 	WARN_ON(rcu);
@@ -877,7 +877,7 @@ static int fusex_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 {
 	struct inode *inode = d_inode(dentry);
 	umode_t mode = inode->i_mode;
-	bool update_mode;
+	bool update_mode = false;
 	int err;
 
 	if (type == ACL_TYPE_ACCESS && acl) {
@@ -1476,7 +1476,7 @@ static int fusex_xattr_get(const struct xattr_handler *handler, struct dentry *d
 			   struct inode *inode, const char *name, void *buffer, size_t size)
 {
 	size_t attr_size;
-	void *value __free(kfree) =
+	void *value __free(kvfree) =
 		fusex_send_lgxattr(inode, name - strlen(handler->prefix), &attr_size);
 
 	if (IS_ERR(value))
