@@ -433,7 +433,12 @@ static int fusex_do_read_folio(struct file *file, struct folio *folio)
 	size_t full_len = folio_size(folio), len = full_len;
 	int err;
 
-	WARN_ON(i_size <= folio_start);
+	/* A racing truncate can leave the folio beyond EOF */
+	if (i_size <= folio_start) {
+		folio_zero_segment(folio, 0, full_len);
+		folio_mark_uptodate(folio);
+		return 0;
+	}
 
 	if (i_size < folio_start + full_len) {
 		len = i_size - folio_start;
