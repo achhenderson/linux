@@ -1680,6 +1680,52 @@ static int fuse_uring_add_bufpool(struct io_uring_cmd *cmd,
 }
 
 /*
+ * Notification on a ring only channel, the same message as written to /dev/fuse:
+ * iov[0] has the fuse_out_header, iov[1] the rest.  No ring entry involved.
+ */
+static int fuse_uring_notify(struct io_uring_cmd *cmd, unsigned int issue_flags,
+			     struct fuse_chan *fch)
+{
+	struct iovec iov[FUSE_URING_IOV_SEGS];
+	struct iovec *headers = &iov[FUSE_URING_IOV_HEADERS];
+	struct iovec *payload = &iov[FUSE_URING_IOV_PAYLOAD];
+	struct fuse_out_header oh;
+	struct fuse_copy_state cs;
+	struct iov_iter iter;
+	int err;
+
+	if (!fch->ring_only)
+		return -EOPNOTSUPP;
+
+	/* Can wait for a request that only the task submitting this can serve */
+	if (issue_flags & IO_URING_F_NONBLOCK)
+		return -EAGAIN;
+
+	err = fuse_uring_get_iovec_from_sqe(cmd->sqe, iov);
+	if (err)
+		return err;
+
+	if (headers->iov_len < sizeof(oh))
+		return -EINVAL;
+
+	if (copy_from_user(&oh, headers->iov_base, sizeof(oh)))
+		return -EFAULT;
+
+	if (oh.unique || oh.len != sizeof(oh) + payload->iov_len)
+		return -EINVAL;
+
+	err = import_ubuf(ITER_SOURCE, payload->iov_base, payload->iov_len, &iter);
+	if (err)
+		return err;
+
+	fuse_copy_init(&cs, false, &iter);
+	err = fuse_notify(fch->conn, oh.error, payload->iov_len, &cs);
+	fuse_copy_finish(&cs);
+
+	return err;
+}
+
+/*
  * Entry function from io_uring to handle the given passthrough command
  * (op code IORING_OP_URING_CMD)
  */
@@ -1765,6 +1811,8 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 			pr_info_once("FUSE_IO_URING_ADD_BUFPOOL failed err=%d\n",
 				     err);
 		return err;
+	case FUSE_IO_URING_CMD_NOTIFY:
+		return fuse_uring_notify(cmd, issue_flags, fch);
 	default:
 		return -EINVAL;
 	}

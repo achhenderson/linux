@@ -930,6 +930,10 @@ int fuse_chan_send_notify_reply(struct fuse_chan *fch, struct fuse_args *args, u
 	struct fuse_req *req;
 	struct fuse_iqueue *fiq = &fch->iq;
 
+	/* A ring entry is committed by its unique */
+	if (fch->ring_only && !unique)
+		return -EINVAL;
+
 	req = fuse_get_req(fch, false);
 	if (IS_ERR(req))
 		return PTR_ERR(req);

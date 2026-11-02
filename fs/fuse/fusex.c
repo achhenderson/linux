@@ -1983,7 +1983,9 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 	max_payload = fuse_uring_max_payload(fm->fc->chan);
 
 	fm->fc->minor = outarg_in.minor;
-	fm->fc->max_write = min_t(size_t, outarg_in.max_write, max_payload);
+	/* FUSE_NOTIFY_REPLY has its header in the payload too */
+	fm->fc->max_write = min_t(size_t, outarg_in.max_write,
+				  max_payload - sizeof(struct fuse_notify_retrieve_in));
 	fm->fc->max_pages = min_t(size_t, max_payload >> PAGE_SHIFT,
 				  min_t(unsigned int, fm->fc->max_pages_limit,
 					max_t(unsigned int, outarg_in.max_pages, 1)));

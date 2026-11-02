@@ -1364,6 +1364,12 @@ enum fuse_uring_cmd {
 
 	/* add a bufpool to a queue */
 	FUSE_IO_URING_CMD_ADD_BUFPOOL = 4,
+
+	/*
+	 * notification from the server on a ring only channel: iov[0] is the
+	 * fuse_out_header, iov[1] the rest
+	 */
+	FUSE_IO_URING_CMD_NOTIFY = 5,
 };
 
 /*
