@@ -1398,6 +1398,7 @@ static int fusex_send_opendir(struct fuse_file *ff, struct inode *inode)
 	if (!err) {
 		ff->fh = outarg.fh;
 		ff->open_flags = FOPEN_CACHE_DIR;
+		ff->nodeid = get_node_id(inode);
 	}
 	return err;
 }
@@ -1440,6 +1441,7 @@ static int fusex_dir_release(struct inode *inode, struct file *file)
 	ra->inarg.fh = ff->fh;
 
 	ra->args.opcode = FUSE_RELEASEDIR;
+	ra->args.nodeid = ff->nodeid;
 	ra->args.force = true;
 	ra->args.nocreds = true;
 	ra->args.end = fusex_release_end;
