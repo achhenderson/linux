@@ -1584,8 +1584,6 @@ static int fusex_fill_super(struct super_block *sb, struct fs_context *fsc)
 	bool io_uring_enabled;
 	int err;
 
-	/* Dropped in fuse_mount_destroy() */
-	fuse_conn_get(fc);
 	fm->sb = sb;
 	fc->dev = sb->s_dev;
 
@@ -1647,12 +1645,16 @@ static int fusex_get_tree(struct fs_context *fsc)
 	struct fuse_mount *fm __free(kfree) = kzalloc_obj(*fm);
 	struct fuse_chan *fch __free(fuse_chan_free) = fuse_dev_chan_new();
 
+	if (!fud)
+		return invalfc(fsc, "fd not set");
 	if (!fch || !fc || !fm)
 		return -ENOMEM;
 
+	fuse_conn_init(fc, fm, fsc->user_ns, fch);
 	fc->release = fuse_free_conn;
 	fsc->s_fs_info = fm;
-	fuse_conn_init(no_free_ptr(fc), no_free_ptr(fm), fsc->user_ns, fch);
+	retain_and_null_ptr(fc);
+	retain_and_null_ptr(fm);
 	fuse_chan_set_initialized(fch, NULL);
 	fuse_dev_install(fud, no_free_ptr(fch));
 
@@ -1683,6 +1685,8 @@ static int fusex_parse_param(struct fs_context *fsc, struct fs_parameter *param)
 
 	switch (opt) {
 	case FUSEX_OPT_FD:
+		if (fsc->fs_private)
+			return invalfc(fsc, "Multiple fd specified");
 		if (param->type != fs_value_is_file)
 			return invalfc(fsc, "FSCONFIG_SET_FD is required for fd");
 		if (param->file->f_op != &fuse_dev_operations)
@@ -1708,7 +1712,14 @@ static int fusex_parse_param(struct fs_context *fsc, struct fs_parameter *param)
 static void fusex_free_fsc(struct fs_context *fsc)
 {
 	struct fuse_dev *fud = fsc->fs_private;
+	struct fuse_mount *fm = fsc->s_fs_info;
 
+	/* No superblock took it over */
+	if (fm) {
+		fuse_conn_destroy(fm);
+		fuse_mount_remove(fm);
+		fuse_mount_destroy(fm);
+	}
 	if (fud)
 		fuse_dev_put(fud);
 }
