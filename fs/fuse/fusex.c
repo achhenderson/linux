@@ -1627,6 +1627,7 @@ static int fusex_fill_super(struct super_block *sb, struct fs_context *fsc)
 		return -ENOMEM;
 
 	fc->parallel_dirops = true;
+	fc->conn_init = 1;
 	fc->destroy = true;
 
 	cp.minor = fc->minor;
@@ -1740,9 +1741,13 @@ static void fusex_kill_sb_anon(struct super_block *sb)
 {
 	struct fuse_mount *fm = get_fuse_mount_super(sb);
 
-	kill_anon_super(sb);
-	fuse_conn_destroy(fm);
+	/* No flush on close, write back while the server is still there */
+	if (sb->s_root)
+		sync_filesystem(sb);
+
 	fuse_mount_remove(fm);
+	fuse_conn_destroy(fm);
+	kill_anon_super(sb);
 	fuse_mount_destroy(fm);
 }
 
