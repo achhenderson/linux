@@ -195,9 +195,22 @@ static int fusex_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return err;
 }
 
+/*
+ * I_DONTCACHE makes iput_final() write back the inode.  That can be on a server
+ * thread or in reclaim and must not wait for the server: leave it to the flusher.
+ */
+static int fusex_drop_inode(struct inode *inode)
+{
+	if (inode_state_read(inode) & I_DIRTY_ALL)
+		inode_state_clear(inode, I_DONTCACHE);
+
+	return inode_generic_drop(inode);
+}
+
 static const struct super_operations fusex_super_operations = {
 	.alloc_inode    = fusex_alloc_inode,
 	.free_inode     = fusex_free_inode,
+	.drop_inode	= fusex_drop_inode,
 	.evict_inode	= fusex_evict_inode,
 	.write_inode	= fusex_write_inode,
 	.umount_begin	= fuse_umount_begin,
@@ -312,7 +325,9 @@ static struct inode *fusex_get_inode(struct super_block *sb, struct fusex_id *id
 		return ERR_PTR(-ENOMEM);
 
 	if (inode_state_read_once(inode) & I_NEW) {
+		spin_lock(&inode->i_lock);
 		inode_state_set(inode, I_DONTCACHE);
+		spin_unlock(&inode->i_lock);
 		err = fusex_send_statx(inode, &statx);
 		if (err) {
 			discard_new_inode(inode);
