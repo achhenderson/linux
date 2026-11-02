@@ -179,7 +179,7 @@ static int fusex_write_inode(struct inode *inode, struct writeback_control *wbc)
 static int fusex_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	FUSE_ARGS(args);
-	struct fuse_statfs_out outarg;
+	struct fuse_statfs_out outarg = {};
 	int err;
 
 	if (!fuse_allow_current_process(get_fuse_conn(d_inode(dentry)))) {
@@ -217,6 +217,12 @@ static const struct super_operations fusex_super_operations = {
 	.statfs		= fusex_statfs,
 };
 
+static void fusex_set_blkbits(struct inode *inode, u32 blksize)
+{
+	get_fuse_inode(inode)->cached_i_blkbits =
+		blksize ? ilog2(blksize) : inode->i_sb->s_blocksize_bits;
+}
+
 static void fusex_set_times(struct inode *inode, struct fuse_statx *attr)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -248,7 +254,7 @@ static void fusex_set_attr(struct inode *inode, struct fuse_statx *attr)
 	inode->i_ino = fi->orig_ino = attr->ino;
 	inode->i_uid = make_kuid(user_ns, attr->uid);
 	inode->i_gid = make_kgid(user_ns, attr->gid);
-	fi->cached_i_blkbits = ilog2(attr->blksize);
+	fusex_set_blkbits(inode, attr->blksize);
 	if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode))
 		inode->i_rdev = MKDEV(attr->rdev_major, attr->rdev_minor);
 
@@ -1060,7 +1066,7 @@ static int fusex_setup_new_inode(struct inode *inode, struct fuse_statx *statx)
 	inode->i_size = statx->size;
 	inode->i_blocks = statx->blocks;
 	inode->i_ino = fi->orig_ino = statx->ino;
-	fi->cached_i_blkbits = ilog2(statx->blksize);
+	fusex_set_blkbits(inode, statx->blksize);
 	fusex_set_times(inode, statx);
 
 	return 0;
@@ -1623,6 +1629,9 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 	err = fuse_simple_request(fm, &args_sx);
 	if (err)
 		return err;
+
+	if (!S_ISDIR(statx->stat.mode) || !fuse_valid_size(statx->stat.size))
+		return -EIO;
 
 	*io_uring_enabled = flags & FUSE_OVER_IO_URING && fuse_uring_enabled();
 
