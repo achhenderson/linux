@@ -1979,8 +1979,8 @@ const struct xattr_handler *const fusex_xattr_handlers[] = {
 	NULL,
 };
 
-static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
-			   struct fuse_statx_out *statx)
+static int fusex_send_init(struct fs_context *fsc, struct fuse_mount *fm,
+			   struct fusex_id *id, struct fuse_statx_out *statx)
 {
 	FUSE_ARGS(args_in);
 	FUSE_ARGS(args_lr);
@@ -2016,8 +2016,11 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 
 	/* A request has to fit the payload buffer of any ring entry */
 	max_payload = fuse_uring_max_payload(fm->fc->chan);
+	if (outarg_in.max_write > max_payload)
+		return invalfc(fsc, "max_write %u exceeds the ring payload buffer %zu",
+			       outarg_in.max_write, max_payload);
 
-	fm->fc->max_write = min_t(size_t, outarg_in.max_write, max_payload);
+	fm->fc->max_write = outarg_in.max_write;
 	fm->fc->max_pages = min_t(size_t, max_payload >> PAGE_SHIFT,
 				  min_t(unsigned int, fm->fc->max_pages_limit,
 					max_t(unsigned int, outarg_in.max_pages, 1)));
@@ -2084,7 +2087,7 @@ static int fusex_fill_super(struct super_block *sb, struct fs_context *fsc)
 	sb->s_flags &= SB_RDONLY;
 	sb->s_flags |= SB_POSIXACL | SB_NOATIME | SB_NOSEC;
 
-	err = fusex_send_init(fm, &id, &statx);
+	err = fusex_send_init(fsc, fm, &id, &statx);
 	if (err)
 		return err;
 
