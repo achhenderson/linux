@@ -284,12 +284,20 @@ static void fusex_set_times(struct inode *inode, struct fuse_statx *attr)
 	}
 }
 
+/* The server changes it without notify_change() */
+static void fusex_set_mode(struct inode *inode, umode_t mode)
+{
+	inode->i_mode = mode;
+	if (is_sxid(mode))
+		inode_set_flags(inode, 0, S_NOSEC);
+}
+
 static void fusex_set_attr(struct inode *inode, struct fuse_statx *attr)
 {
 	struct user_namespace *user_ns = i_user_ns(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 
-	inode->i_mode = attr->mode;
+	fusex_set_mode(inode, attr->mode);
 	i_size_write(inode, attr->size);
 	inode->i_blocks = attr->blocks;
 	inode->i_ino = fi->orig_ino = attr->ino;
@@ -457,7 +465,7 @@ static int fusex_fetch_attr(struct inode *inode, bool perm_only)
 		return 0;
 	}
 	if (perm_only) {
-		inode->i_mode = stat->mode;
+		fusex_set_mode(inode, stat->mode);
 		inode->i_uid = make_kuid(i_user_ns(inode), stat->uid);
 		inode->i_gid = make_kgid(i_user_ns(inode), stat->gid);
 	} else {
@@ -480,8 +488,9 @@ static int fusex_fetch_attr(struct inode *inode, bool perm_only)
  * The inode is authoritative until it is invalidated, by the server or by an
  * operation that makes the server change it.
  *
- * For a regular file this needs i_rwsem held to keep writers out of the flush
- * and the size update, unless @perm_only.  That leaves the rest invalid.
+ * For a regular file this needs i_rwsem held exclusively to keep writers out of
+ * the flush and the size update, unless @perm_only.  That leaves the rest
+ * invalid.
  *
  * Local changes can keep invalidating the reply: give up after a few tries and
  * leave it to the next user.
@@ -530,11 +539,19 @@ static void fusex_attr_changed(struct inode *inode)
 	spin_unlock(&fi->lock);
 }
 
-/* Under i_rwsem */
-static void fusex_grow_size(struct inode *inode, loff_t size)
+/* Writers can share i_rwsem.  Returns the size this replaced. */
+static loff_t fusex_grow_size(struct inode *inode, loff_t size)
 {
-	if (size > inode->i_size)
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	loff_t old_size;
+
+	spin_lock(&fi->lock);
+	old_size = inode->i_size;
+	if (size > old_size)
 		i_size_write(inode, size);
+	spin_unlock(&fi->lock);
+
+	return old_size;
 }
 
 static ssize_t fusex_send_read(struct file *file, struct fuse_args_pages *ap,
@@ -714,8 +731,8 @@ static ssize_t fusex_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 static ssize_t fusex_direct_write(struct kiocb *iocb, struct iov_iter *from, size_t count)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
-	loff_t old_size = inode->i_size;
 	loff_t pos = iocb->ki_pos;
+	loff_t old_size;
 	ssize_t res;
 
 	/*
@@ -731,36 +748,61 @@ static ssize_t fusex_direct_write(struct kiocb *iocb, struct iov_iter *from, siz
 		return res;
 
 	/* Before the invalidation: a fault after it must see the new size */
-	fusex_grow_size(inode, iocb->ki_pos);
+	old_size = fusex_grow_size(inode, iocb->ki_pos);
 	fusex_extend_file(inode, old_size, pos);
 
-	/* A fault during the write can have read the old data */
-	invalidate_inode_pages2_range(inode->i_mapping, pos >> PAGE_SHIFT,
+	/*
+	 * A fault during the write can have read the old data.  Another writer
+	 * can be in the hole, so the folio zeroed for it can't stay either.
+	 */
+	invalidate_inode_pages2_range(inode->i_mapping, min(old_size, pos) >> PAGE_SHIFT,
 				      (iocb->ki_pos - 1) >> PAGE_SHIFT);
 	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODIFY);
 
 	return res;
 }
 
+/* Removing privileges and fetching the size can't run next to other writers */
+static bool fusex_write_needs_excl(struct inode *inode)
+{
+	return !IS_NOSEC(inode) ||
+	       fusex_attr_stale(get_fuse_inode(inode), STATX_SIZE);
+}
+
+/* The data goes to the server, which orders the writes.  Only append needs EOF. */
 static ssize_t fusex_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
+	bool excl = (iocb->ki_flags & IOCB_APPEND) || fusex_write_needs_excl(inode);
 	ssize_t res = 0;
 
-	inode_lock(inode);
-	if (fusex_attr_stale(get_fuse_inode(inode), STATX_SIZE))
-		res = fusex_refresh_attr(inode, false);
+	if (!excl) {
+		inode_lock_shared(inode);
+		if (fusex_write_needs_excl(inode)) {
+			inode_unlock_shared(inode);
+			excl = true;
+		}
+	}
+	if (excl) {
+		inode_lock(inode);
+		if (fusex_attr_stale(get_fuse_inode(inode), STATX_SIZE))
+			res = fusex_refresh_attr(inode, false);
+	}
 	if (!res)
 		res = generic_write_checks(iocb, from);
 	if (res > 0) {
 		size_t count = res;
 
-		res = file_modified(file);
+		/* The times are the server's, this is only about privileges */
+		res = excl ? file_modified(file) : 0;
 		if (!res)
 			res = fusex_direct_write(iocb, from, count);
 	}
-	inode_unlock(inode);
+	if (excl)
+		inode_unlock(inode);
+	else
+		inode_unlock_shared(inode);
 
 	return res > 0 ? generic_write_sync(iocb, res) : res;
 }
@@ -889,6 +931,7 @@ static int fusex_file_mmap_prepare(struct vm_area_desc *desc)
 }
 
 static const struct file_operations fusex_file_operations = {
+	.fop_flags	= FOP_DIO_PARALLEL_WRITE,
 	.read_iter	= fusex_file_read_iter,
 	.write_iter	= fusex_file_write_iter,
 	.splice_read	= copy_splice_read,
@@ -2048,7 +2091,7 @@ static int fusex_fill_super(struct super_block *sb, struct fs_context *fsc)
 	sb->s_blocksize = PAGE_SIZE;
 	sb->s_blocksize_bits = PAGE_SHIFT;
 	sb->s_flags &= SB_RDONLY;
-	sb->s_flags |= SB_POSIXACL | SB_NOATIME;
+	sb->s_flags |= SB_POSIXACL | SB_NOATIME | SB_NOSEC;
 
 	err = fusex_send_init(fm, &id, &statx);
 	if (err)
