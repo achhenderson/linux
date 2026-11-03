@@ -5,8 +5,6 @@
 
 #include <linux/types.h>
 
-struct fuse_mount;
-
 /** One input argument of a request */
 struct fuse_in_arg {
 	unsigned size;
@@ -27,29 +25,18 @@ struct fuse_args {
 	u32 pid;
 	u8 in_numargs;
 	u8 out_numargs;
-	u8 ext_idx;
 	bool force:1;
-	bool noreply:1;
 	bool nocreds:1;
 	bool in_pages:1;
 	bool out_pages:1;
-	bool user_pages:1;
 	bool out_argvar:1;
 	bool out_var_alloc:1;
-	bool page_zeroing:1;
-	bool page_replace:1;
-	bool may_block:1;
-	bool is_ext:1;
-	bool is_pinned:1;
-	bool invalidate_vmap:1;
 	bool abort_on_kill:1;
 	/* server requested io-uring zero-copy for this op */
 	bool zero_copy:1;
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];
 	void (*end)(struct fuse_args *args, int error);
-	/* Used for kvec iter backed by vmalloc address */
-	void *vmap_base;
 };
 
 /** FUSE folio descriptor */

@@ -49,51 +49,26 @@ static int fuse_fill_creds(struct fuse_mount *fm, struct fuse_args *args, struct
 	return 0;
 }
 
-static int fuse_req_prep(struct fuse_mount *fm, struct fuse_args *args, struct mnt_idmap *idmap)
-{
-	if (!args->force && fm->fc->conn_error)
-		return -ECONNREFUSED;
-
-	return fuse_fill_creds(fm, args, idmap);
-}
-
 ssize_t __fuse_simple_request(struct mnt_idmap *idmap, struct fuse_mount *fm,
 			      struct fuse_args *args)
 {
-	struct fuse_conn *fc = fm->fc;
-	int err = fuse_req_prep(fm, args, idmap);
+	int err = fuse_fill_creds(fm, args, idmap);
 
 	if (err)
 		return err;
 
-	return fuse_chan_send(fc->chan, args);
+	return fuse_chan_send(fm->fc->chan, args);
 }
 
 int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args, gfp_t gfp_flags)
 {
-	struct fuse_conn *fc = fm->fc;
 	int err;
 
 	WARN_ON(args->force && !args->nocreds);
 
-	err = fuse_req_prep(fm, args, &invalid_mnt_idmap);
+	err = fuse_fill_creds(fm, args, &invalid_mnt_idmap);
 	if (err)
 		return err;
 
-	return fuse_chan_send_bg(fc->chan, args, gfp_flags);
-}
-EXPORT_SYMBOL_GPL(fuse_simple_background);
-
-int fuse_simple_notify_reply(struct fuse_mount *fm, struct fuse_args *args, u64 unique)
-{
-	struct fuse_conn *fc = fm->fc;
-	int err;
-
-	WARN_ON(args->force && !args->nocreds);
-
-	err = fuse_req_prep(fm, args, &invalid_mnt_idmap);
-	if (err)
-		return err;
-
-	return fuse_chan_send_notify_reply(fc->chan, args, unique);
+	return fuse_chan_send_bg(fm->fc->chan, args, gfp_flags);
 }

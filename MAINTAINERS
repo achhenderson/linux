@@ -10794,9 +10794,6 @@ L:	fuse-devel@lists.linux.dev
 S:	Maintained
 T:	git git://git.kernel.org/pub/scm/linux/kernel/git/mszeredi/fuse.git
 F:	Documentation/filesystems/fuse/fuse-passthrough.rst
-F:	fs/fuse/backing.c
-F:	fs/fuse/iomode.c
-F:	fs/fuse/passthrough.c
 
 FUTEX SUBSYSTEM
 M:	Thomas Gleixner <tglx@kernel.org>
@@ -28967,7 +28964,6 @@ L:	linux-fsdevel@vger.kernel.org
 S:	Supported
 W:	https://virtio-fs.gitlab.io/
 F:	Documentation/filesystems/virtiofs.rst
-F:	fs/fuse/virtio_fs.c
 F:	include/uapi/linux/virtio_fs.h
 
 VIRTIO GPIO DRIVER

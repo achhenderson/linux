@@ -8,7 +8,6 @@
 #include <linux/miscdevice.h>
 #include <linux/pagemap.h>
 #include <linux/exportfs.h>
-#include <linux/iversion.h>
 #include <linux/posix_acl_xattr.h>
 #include <linux/statfs.h>
 #include <linux/falloc.h>
@@ -17,9 +16,6 @@
 #include <uapi/linux/magic.h>
 
 static void fusex_init_inode(struct inode *inode);
-
-/* In fi->state: mtime or ctime changed here and the server doesn't know yet */
-#define FUSEX_I_CMTIME_DIRTY	(BITS_PER_LONG - 1)
 
 #define FUSEX_ATTR_PERM		(STATX_MODE | STATX_UID | STATX_GID)
 
@@ -198,28 +194,26 @@ static void fusex_get_ctime(const struct inode *inode, struct fuse_statx *sx)
 	sx->ctime.tv_nsec = inode->i_ctime_nsec;
 }
 
-static int fusex_write_inode(struct inode *inode, struct writeback_control *wbc)
+/* The cache is the server's, sync(2) has to reach it */
+static int fusex_sync_fs(struct super_block *sb, int wait)
 {
-	struct fuse_inode *fi = get_fuse_inode(inode);
-	struct fuse_setstatx_in inarg;
-	bool cmtime;
+	FUSE_ARGS(args);
+	struct fuse_syncfs_in inarg;
 	int err;
 
+	if (!wait)
+		return 0;
+
+	/* generic_shutdown_super() syncs after clearing s_root, the server is gone */
+	if (!sb->s_root)
+		return 0;
+
 	memset(&inarg, 0, sizeof(inarg));
+	args.opcode = FUSE_SYNCFS;
+	ADD_IN_ARG_S(args, &inarg);
+	err = fusex_inode_request(d_inode(sb->s_root), &args);
 
-	fusex_get_atime(inode, &inarg.stat);
-	/* The server's can be newer unless they changed here */
-	cmtime = test_and_clear_bit(FUSEX_I_CMTIME_DIRTY, &fi->state);
-	if (cmtime) {
-		fusex_get_mtime(inode, &inarg.stat);
-		fusex_get_ctime(inode, &inarg.stat);
-	}
-
-	err = fusex_send_setstatx(inode, &inarg);
-	if (err && cmtime)
-		set_bit(FUSEX_I_CMTIME_DIRTY, &fi->state);
-
-	return err;
+	return err == -ENOSYS ? 0 : err;
 }
 
 static int fusex_statfs(struct dentry *dentry, struct kstatfs *buf)
@@ -259,7 +253,7 @@ static const struct super_operations fusex_super_operations = {
 	.free_inode     = fusex_free_inode,
 	.drop_inode	= fusex_drop_inode,
 	.evict_inode	= fusex_evict_inode,
-	.write_inode	= fusex_write_inode,
+	.sync_fs	= fusex_sync_fs,
 	.umount_begin	= fuse_umount_begin,
 	.statfs		= fusex_statfs,
 };
@@ -430,9 +424,8 @@ static bool fusex_attr_stale(struct fuse_inode *fi, u32 mask)
 }
 
 /*
- * The data is flushed first so that the reply includes it.  Local times are
- * replaced, not flushed: the server invalidated them.  A change during the
- * request makes the reply useless.
+ * Mapped data is flushed first so that the reply includes it.  A change during
+ * the request makes the reply useless.
  */
 static int fusex_fetch_attr(struct inode *inode, bool perm_only)
 {
@@ -469,10 +462,6 @@ static int fusex_fetch_attr(struct inode *inode, bool perm_only)
 		inode->i_gid = make_kgid(i_user_ns(inode), stat->gid);
 	} else {
 		fusex_set_attr(inode, stat);
-		clear_bit(FUSEX_I_CMTIME_DIRTY, &fi->state);
-		/* The readdir cache has no page to drop if the directory is empty */
-		if (S_ISDIR(inode->i_mode))
-			inode_inc_iversion(inode);
 	}
 	spin_unlock(&fi->lock);
 
@@ -488,9 +477,8 @@ static int fusex_fetch_attr(struct inode *inode, bool perm_only)
 }
 
 /*
- * The inode is authoritative until the server invalidates it, nothing else
- * makes the kernel ask for the attributes.  atime is the kernel's, the shared
- * readdir code marks it invalid after every read.
+ * The inode is authoritative until it is invalidated, by the server or by an
+ * operation that makes the server change it.
  *
  * For a regular file this needs i_rwsem held to keep writers out of the flush
  * and the size update, unless @perm_only.  That leaves the rest invalid.
@@ -501,7 +489,7 @@ static int fusex_fetch_attr(struct inode *inode, bool perm_only)
 static int fusex_refresh_attr(struct inode *inode, bool perm_only)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
-	const u32 mask = perm_only ? FUSEX_ATTR_PERM : ~(u32)STATX_ATIME;
+	const u32 mask = perm_only ? FUSEX_ATTR_PERM : ~0U;
 	int tries = 3;
 	int err = 0;
 
@@ -542,49 +530,239 @@ static void fusex_attr_changed(struct inode *inode)
 	spin_unlock(&fi->lock);
 }
 
-/* fi->lock: a STORE notification grows the file without i_rwsem */
+/* Under i_rwsem */
 static void fusex_grow_size(struct inode *inode, loff_t size)
 {
-	struct fuse_inode *fi = get_fuse_inode(inode);
-
-	spin_lock(&fi->lock);
 	if (size > inode->i_size)
 		i_size_write(inode, size);
-	spin_unlock(&fi->lock);
 }
 
-static int fusex_iocb_refresh_attr(struct kiocb *iocb)
+static ssize_t fusex_send_read(struct file *file, struct fuse_args_pages *ap,
+			       loff_t pos, size_t len)
 {
-	struct inode *inode = file_inode(iocb->ki_filp);
+	struct fuse_read_in inarg;
 
-	if ((iocb->ki_flags & IOCB_NOWAIT) &&
-	    fusex_attr_stale(get_fuse_inode(inode), STATX_SIZE))
-		return -EAGAIN;
+	memset(&inarg, 0, sizeof(inarg));
+	inarg.offset = pos;
+	inarg.size = len;
+	inarg.flags = file->f_flags;
 
-	return fusex_refresh_attr_unlocked(inode, STATX_SIZE);
+	memset(&ap->args, 0, sizeof(ap->args));
+	ap->args.opcode = FUSE_READ;
+	ADD_IN_ARG_S(ap->args, &inarg);
+	ADD_OUT_ARG(ap->args, len, NULL);
+	ap->args.out_argvar = true;
+	ap->args.out_pages = true;
+
+	return fusex_inode_request(file_inode(file), &ap->args);
+}
+
+/* Writeback has no @file */
+static ssize_t fusex_send_write(struct inode *inode, struct file *file,
+				struct fuse_args_pages *ap, loff_t pos, size_t len)
+{
+	struct fuse_write_in inarg;
+	struct fuse_write_out outarg;
+	int err;
+
+	memset(&inarg, 0, sizeof(inarg));
+	inarg.offset = pos;
+	inarg.size = len;
+	inarg.flags = file ? file->f_flags : 0;
+
+	memset(&ap->args, 0, sizeof(ap->args));
+	ap->args.opcode = FUSE_WRITE;
+	/* A signal to whoever flushes must not lose somebody else's write */
+	ap->args.force = !file;
+	ap->args.nocreds = !file;
+	ADD_IN_ARG_S(ap->args, &inarg);
+	ADD_IN_ARG(ap->args, len, NULL);
+	ap->args.in_pages = true;
+	ADD_OUT_ARG_S(ap->args, &outarg);
+
+	err = fusex_inode_request(inode, &ap->args);
+	if (err)
+		return err;
+
+	if (!outarg.size || outarg.size > len)
+		return -EIO;
+
+	return outarg.size;
+}
+
+/* Fills @ap with up to @max_pages pages holding up to @count bytes of @iter */
+static ssize_t fusex_get_pages(struct fuse_args_pages *ap, struct page **pages,
+			       struct iov_iter *iter, size_t count,
+			       unsigned int max_pages)
+{
+	size_t nbytes = 0;
+
+	ap->num_folios = 0;
+	while (nbytes < count && ap->num_folios < max_pages) {
+		unsigned int i;
+		size_t off;
+		ssize_t len;
+
+		len = iov_iter_extract_pages(iter, &pages, count - nbytes,
+					     max_pages - ap->num_folios, 0, &off);
+		if (len <= 0)
+			return nbytes ?: len;
+
+		nbytes += len;
+		for (i = 0; len; i++) {
+			struct folio *folio = page_folio(pages[i]);
+			unsigned int part = umin(len, PAGE_SIZE - off);
+
+			ap->folios[ap->num_folios] = folio;
+			ap->descs[ap->num_folios].offset =
+				off + folio_page_idx(folio, pages[i]) * PAGE_SIZE;
+			ap->descs[ap->num_folios].length = part;
+			ap->num_folios++;
+			off = 0;
+			len -= part;
+		}
+	}
+
+	return nbytes;
+}
+
+static void fusex_put_pages(struct fuse_args_pages *ap, struct iov_iter *iter, bool dirty)
+{
+	unsigned int i;
+
+	if (!iov_iter_extract_will_pin(iter))
+		return;
+
+	for (i = 0; i < ap->num_folios; i++) {
+		if (dirty)
+			folio_mark_dirty_lock(ap->folios[i]);
+		unpin_folio(ap->folios[i]);
+	}
+}
+
+/* Sends @count bytes of @iter to or from the server at iocb->ki_pos */
+static ssize_t fusex_direct_io(struct kiocb *iocb, struct iov_iter *iter, size_t count)
+{
+	struct file *file = iocb->ki_filp;
+	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
+	bool write = iov_iter_rw(iter) == WRITE;
+	unsigned int max_pages = iov_iter_npages(iter, fc->max_pages);
+	struct fuse_args_pages ap = {};
+	size_t done = 0;
+	ssize_t res = 0;
+
+	struct page **pages __free(kfree) = kzalloc_objs(struct page *, max_pages);
+	struct folio **folios __free(kfree) =
+		fuse_folios_alloc(max_pages, GFP_KERNEL, &ap.descs);
+
+	if (!pages || !folios)
+		return -ENOMEM;
+
+	ap.folios = folios;
+
+	while (done < count) {
+		size_t len = write ? umin(count - done, fc->max_write) : count - done;
+		loff_t pos = iocb->ki_pos + done;
+		ssize_t got = fusex_get_pages(&ap, pages, iter, len, max_pages);
+
+		if (got <= 0) {
+			res = got;
+			break;
+		}
+
+		res = write ? fusex_send_write(file_inode(file), file, &ap, pos, got) :
+			      fusex_send_read(file, &ap, pos, got);
+		fusex_put_pages(&ap, iter, !write && res > 0);
+
+		if (res < got)
+			iov_iter_revert(iter, got - max_t(ssize_t, res, 0));
+		if (res > 0)
+			done += res;
+		if (res < got)
+			break;
+	}
+	iocb->ki_pos += done;
+
+	return done ?: res;
 }
 
 static ssize_t fusex_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
-	int err = fusex_iocb_refresh_attr(iocb);
+	struct inode *inode = file_inode(iocb->ki_filp);
+	int err = fusex_refresh_attr_unlocked(inode, STATX_SIZE);
+	loff_t size = i_size_read(inode);
+	size_t count;
+	ssize_t res;
 
-	return err ?: generic_file_read_iter(iocb, to);
+	if (err)
+		return err;
+
+	if (!iov_iter_count(to) || iocb->ki_pos >= size)
+		return 0;
+
+	count = umin(iov_iter_count(to), size - iocb->ki_pos);
+
+	/* A dirty folio has what this should read */
+	res = kiocb_write_and_wait(iocb, count);
+	if (!res)
+		res = fusex_direct_io(iocb, to, count);
+	fuse_invalidate_atime(inode);
+
+	return res;
+}
+
+static ssize_t fusex_direct_write(struct kiocb *iocb, struct iov_iter *from, size_t count)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	loff_t old_size = inode->i_size;
+	loff_t pos = iocb->ki_pos;
+	ssize_t res;
+
+	/*
+	 * The writeback of a dirty folio must not overwrite this later.  -EBUSY
+	 * leaves a stale folio at worst, the server gets the data regardless.
+	 */
+	res = kiocb_invalidate_pages(iocb, count);
+	if (res && res != -EBUSY)
+		return res;
+
+	res = fusex_direct_io(iocb, from, count);
+	if (res <= 0)
+		return res;
+
+	/* Before the invalidation: a fault after it must see the new size */
+	fusex_grow_size(inode, iocb->ki_pos);
+	fusex_extend_file(inode, old_size, pos);
+
+	/* A fault during the write can have read the old data */
+	invalidate_inode_pages2_range(inode->i_mapping, pos >> PAGE_SHIFT,
+				      (iocb->ki_pos - 1) >> PAGE_SHIFT);
+	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODIFY);
+
+	return res;
 }
 
 static ssize_t fusex_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
-	int err = fusex_iocb_refresh_attr(iocb);
+	struct file *file = iocb->ki_filp;
+	struct inode *inode = file_inode(file);
+	ssize_t res = 0;
 
-	return err ?: generic_file_write_iter(iocb, from);
-}
+	inode_lock(inode);
+	if (fusex_attr_stale(get_fuse_inode(inode), STATX_SIZE))
+		res = fusex_refresh_attr(inode, false);
+	if (!res)
+		res = generic_write_checks(iocb, from);
+	if (res > 0) {
+		size_t count = res;
 
-static ssize_t fusex_file_splice_read(struct file *in, loff_t *ppos,
-				      struct pipe_inode_info *pipe, size_t len,
-				      unsigned int flags)
-{
-	int err = fusex_refresh_attr_unlocked(file_inode(in), STATX_SIZE);
+		res = file_modified(file);
+		if (!res)
+			res = fusex_direct_write(iocb, from, count);
+	}
+	inode_unlock(inode);
 
-	return err ?: filemap_splice_read(in, ppos, pipe, len, flags);
+	return res > 0 ? generic_write_sync(iocb, res) : res;
 }
 
 static loff_t fusex_file_llseek(struct file *file, loff_t offset, int whence)
@@ -653,139 +831,122 @@ static long fusex_file_fallocate(struct file *file, int mode, loff_t offset, lof
 	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
 		truncate_pagecache_range(inode, offset, end - 1);
 
+	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODIFY);
+
+	return 0;
+}
+
+/* Mapped data goes to the server, and only the server can make it durable */
+static int fusex_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+	struct inode *inode = file_inode(file);
+	FUSE_ARGS(args);
+	struct fuse_fsync_in inarg;
+	int err;
+
+	err = file_write_and_wait_range(file, start, end);
+	if (err)
+		return err;
+
+	memset(&inarg, 0, sizeof(inarg));
+	inarg.fsync_flags = datasync ? FUSE_FSYNC_FDATASYNC : 0;
+	if (S_ISDIR(inode->i_mode)) {
+		inarg.fh = ((struct fuse_file *) file->private_data)->fh;
+		args.opcode = FUSE_FSYNCDIR;
+	} else {
+		args.opcode = FUSE_FSYNC;
+	}
+	ADD_IN_ARG_S(args, &inarg);
+	err = fusex_inode_request(inode, &args);
+
+	return err == -ENOSYS ? 0 : err;
+}
+
+/*
+ * The server stamps the times when the data gets there.  After the folio is
+ * dirty: a fetch that clears this flushes the folio first.
+ */
+static vm_fault_t fusex_page_mkwrite(struct vm_fault *vmf)
+{
+	vm_fault_t ret = filemap_page_mkwrite(vmf);
+
+	fuse_invalidate_attr_mask(file_inode(vmf->vma->vm_file), FUSE_STATX_MODIFY);
+
+	return ret;
+}
+
+static const struct vm_operations_struct fusex_file_vm_ops = {
+	.fault		= filemap_fault,
+	.map_pages	= filemap_map_pages,
+	.page_mkwrite	= fusex_page_mkwrite,
+};
+
+static int fusex_file_mmap_prepare(struct vm_area_desc *desc)
+{
+	desc->vm_ops = &fusex_file_vm_ops;
+
 	return 0;
 }
 
 static const struct file_operations fusex_file_operations = {
 	.read_iter	= fusex_file_read_iter,
 	.write_iter	= fusex_file_write_iter,
-	.splice_read	= fusex_file_splice_read,
+	.splice_read	= copy_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.llseek		= fusex_file_llseek,
-	.mmap_prepare	= generic_file_mmap_prepare,
-	.fsync		= simple_fsync_noflush,
+	.mmap_prepare	= fusex_file_mmap_prepare,
+	.fsync		= fusex_fsync,
 	.fallocate	= fusex_file_fallocate,
 };
 
-static int fusex_send_read(struct inode *inode, loff_t pos, struct file *file,
-			   struct folio *folio, unsigned int off, unsigned int len)
-{
-	struct fuse_args_pages ap = {};
-	struct fuse_folio_desc desc = { .offset = off, .length = len };
-	struct fuse_read_in inarg;
-	ssize_t res;
-
-	memset(&inarg, 0, sizeof(inarg));
-	inarg.offset = pos;
-	inarg.size = len;
-	inarg.flags = file->f_flags;
-	ap.args.opcode = FUSE_READ;
-	ADD_IN_ARG_S(ap.args, &inarg);
-	ADD_OUT_ARG(ap.args, len, NULL);
-	ap.args.out_argvar = true;
-	ap.args.out_pages = true;
-	ap.num_folios = 1;
-	ap.folios = &folio;
-	ap.descs = &desc;
-
-	res = fusex_inode_request(inode, &ap.args);
-	if (res < 0)
-		return res;
-
-	WARN_ON(res > len);
-	if (res < len)
-		folio_zero_segment(folio, off + res, off + len);
-
-	return 0;
-}
-
-static int fusex_do_read_folio(struct file *file, struct folio *folio)
-{
-	struct inode *inode = folio->mapping->host;
-	loff_t folio_start = folio_pos(folio);
-	loff_t i_size = i_size_read(inode);
-	size_t full_len = folio_size(folio), len = full_len;
-	int err;
-
-	/* A racing truncate can leave the folio beyond EOF */
-	if (i_size <= folio_start) {
-		folio_zero_segment(folio, 0, full_len);
-		folio_mark_uptodate(folio);
-		return 0;
-	}
-
-	if (i_size < folio_start + full_len) {
-		len = i_size - folio_start;
-		folio_zero_segment(folio, len, full_len);
-	}
-	err = fusex_send_read(inode, folio_start, file, folio, 0, len);
-	if (err)
-		return err;
-
-	folio_mark_uptodate(folio);
-
-	return 0;
-}
-
 static int fusex_read_folio(struct file *file, struct folio *folio)
 {
-	int err = fusex_do_read_folio(file, folio);
+	struct inode *inode = folio->mapping->host;
+	struct fuse_folio_desc desc = {};
+	struct fuse_args_pages ap = {
+		.folios = &folio, .descs = &desc, .num_folios = 1,
+	};
+	loff_t pos = folio_pos(folio);
+	loff_t i_size = i_size_read(inode);
+	ssize_t res = 0;
 
+	/* A racing truncate can leave the folio beyond EOF */
+	if (pos < i_size) {
+		desc.length = min_t(loff_t, folio_size(folio), i_size - pos);
+		res = fusex_send_read(file, &ap, pos, desc.length);
+	}
+	if (res >= 0) {
+		folio_zero_segment(folio, res, folio_size(folio));
+		folio_mark_uptodate(folio);
+		fuse_invalidate_atime(inode);
+		res = 0;
+	}
 	folio_unlock(folio);
-	return err;
-}
 
-static int fusex_send_write(struct inode *inode, loff_t pos, struct folio *folio,
-			    unsigned int off, unsigned int len, bool writeback)
-{
-	struct fuse_args_pages ap = {};
-	struct fuse_folio_desc desc = { .offset = off, .length = len };
-	struct fuse_write_in inarg;
-	struct fuse_write_out outarg;
-	int err;
-
-	memset(&inarg, 0, sizeof(inarg));
-	inarg.offset = pos;
-	inarg.size = len;
-
-	ap.args.opcode = FUSE_WRITE;
-	/* A signal to whoever flushes must not lose somebody else's write */
-	ap.args.force = writeback;
-	ap.args.nocreds = writeback;
-	ADD_IN_ARG_S(ap.args, &inarg);
-	ADD_IN_ARG(ap.args, len, NULL);
-	ap.args.in_pages = true;
-	ap.num_folios = 1;
-	ap.folios = &folio;
-	ap.descs = &desc;
-	ADD_OUT_ARG_S(ap.args, &outarg);
-
-	err = fusex_inode_request(inode, &ap.args);
-	if (err)
-		return err;
-
-	if (outarg.size != len)
-		return -EIO;
-
-	return 0;
+	return res;
 }
 
 static int fusex_write_folio(struct folio *folio)
 {
 	struct inode *inode = folio->mapping->host;
-	loff_t folio_start = folio_pos(folio);
+	struct fuse_folio_desc desc = {};
+	struct fuse_args_pages ap = {
+		.folios = &folio, .descs = &desc, .num_folios = 1,
+	};
+	loff_t pos = folio_pos(folio);
 	loff_t i_size = i_size_read(inode);
-	size_t len = folio_size(folio);
 	int err = 0;
 
 	/* This is what clears the dirty tag */
 	folio_start_writeback(folio);
 
-	if (folio_start < i_size) {
-		if (i_size < folio_start + len)
-			len = i_size - folio_start;
+	if (pos < i_size) {
+		ssize_t res;
 
-		err = fusex_send_write(inode, folio_start, folio, 0, len, true);
+		desc.length = min_t(loff_t, folio_size(folio), i_size - pos);
+		res = fusex_send_write(inode, NULL, &ap, pos, desc.length);
+		if (res != desc.length)
+			err = res < 0 ? res : -EIO;
 		if (err)
 			mapping_set_error(folio->mapping, err);
 	}
@@ -817,166 +978,27 @@ static int fusex_launder_folio(struct folio *folio)
 	return fusex_write_folio(folio);
 }
 
-static int fusex_write_begin(const struct kiocb *iocb, struct address_space *mapping,
-			     loff_t pos, unsigned int len,
-			     struct folio **foliop, void **fsdata)
-{
-	struct folio *folio;
-
-	folio = __filemap_get_folio(mapping, pos / PAGE_SIZE, FGP_WRITEBEGIN,
-				    mapping_gfp_mask(mapping));
-	if (IS_ERR(folio))
-		return PTR_ERR(folio);
-
-	if (!folio_test_uptodate(folio) && (len != folio_size(folio))) {
-		if (folio->mapping->host->i_size <= folio_pos(folio)) {
-			folio_zero_segment(folio, 0, folio_size(folio));
-			folio_mark_uptodate(folio);
-		} else {
-			int err = fusex_do_read_folio(iocb->ki_filp, folio);
-			if (err) {
-				folio_unlock(folio);
-				folio_put(folio);
-				return err;
-			}
-		}
-	}
-	*foliop = folio;
-
-	return 0;
-}
-
-static int fusex_write_end(const struct kiocb *iocb, struct address_space *mapping,
-			    loff_t pos, unsigned int len, unsigned int copied,
-			    struct folio *folio, void *fsdata)
-{
-	struct inode *inode = folio->mapping->host;
-	loff_t old_size = inode->i_size;
-	loff_t end_pos = pos + copied;
-	int err = 0;
-
-	if (!folio_test_uptodate(folio)) {
-		if (copied < len) {
-			size_t off = offset_in_folio(folio, end_pos);
-
-			err = fusex_send_read(inode, end_pos, iocb->ki_filp, folio,
-					      off, len - copied);
-			if (err)
-				goto out;
-		}
-		folio_mark_uptodate(folio);
-	}
-	if (end_pos > old_size)
-		fusex_grow_size(inode, end_pos);
-out:
-	folio_mark_dirty(folio);
-	folio_unlock(folio);
-	folio_put(folio);
-
-	if (!err)
-		fusex_extend_file(inode, old_size, pos);
-
-	return err ? err : copied;
-}
-
-static ssize_t fusex_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
-{
-	struct inode *inode = file_inode(iocb->ki_filp);
-	loff_t old_size = i_size_read(inode);
-	loff_t pos = iocb->ki_pos;
-	int err = 0;
-
-	if (!iov_iter_count(iter) || (iov_iter_rw(iter) == READ && pos >= old_size))
-		return 0;
-
-	for (;;) {
-		struct page **pages = NULL;
-		struct folio *folio;
-		ssize_t len;
-		size_t off;
-
-		len = iov_iter_extract_pages(iter, &pages, PAGE_SIZE, 1, 0, &off);
-		if (len <= 0) {
-			err = len;
-			break;
-		}
-
-		folio = page_folio(pages[0]);
-		off += folio_page_idx(folio, pages[0]) * PAGE_SIZE;
-		kvfree(pages);
-
-		if (iov_iter_rw(iter) == WRITE) {
-			err = fusex_send_write(inode, pos, folio, off, len, false);
-		} else {
-			if (pos + len > old_size)
-				len = old_size - pos;
-
-			err = fusex_send_read(inode, pos, iocb->ki_filp, folio, off, len);
-			if (!err && user_backed_iter(iter))
-				folio_mark_dirty_lock(folio);
-		}
-		if (iov_iter_extract_will_pin(iter))
-			unpin_folio(folio);
-
-		if (err || !len)
-			break;
-		pos += len;
-	}
-	if (pos > iocb->ki_pos) {
-		if (iov_iter_rw(iter) == WRITE) {
-			if (pos > old_size)
-				fusex_grow_size(inode, pos);
-			fusex_extend_file(inode, old_size, iocb->ki_pos);
-		}
-	}
-
-	return (pos - iocb->ki_pos) ?: err;
-}
-
-static const struct address_space_operations fusex_file_aops  = {
+/* Only mappings use the page cache, read(2) and write(2) are direct */
+static const struct address_space_operations fusex_file_aops = {
 	.read_folio	= fusex_read_folio,
 	.writepages	= fusex_writepages,
 	.launder_folio	= fusex_launder_folio,
-	.write_begin	= fusex_write_begin,
-	.write_end	= fusex_write_end,
-	.direct_IO	= fusex_direct_IO,
+	/* open() needs this for O_DIRECT */
+	.direct_IO	= noop_direct_IO,
 	.dirty_folio	= filemap_dirty_folio,
 	.migrate_folio	= filemap_migrate_folio,
 };
 
-static void fusex_cmtime_dirty(struct inode *inode)
-{
-	set_bit(FUSEX_I_CMTIME_DIRTY, &get_fuse_inode(inode)->state);
-	__mark_inode_dirty(inode, I_DIRTY_SYNC);
-}
-
+/* The server keeps the times, it stamps what it is asked to do */
 static void fusex_dir_modified(struct inode *dir)
 {
 	fusex_attr_changed(dir);
-	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
-	inode_inc_iversion(dir);
-	fusex_cmtime_dirty(dir);
+	fuse_invalidate_attr_mask(dir, FUSE_STATX_MODDIR);
 }
 
-static void fusex_update_ctime(struct inode *inode)
+static void fusex_ctime_changed(struct inode *inode)
 {
-	inode_set_ctime_current(inode);
-	fusex_cmtime_dirty(inode);
-}
-
-static int fusex_update_time(struct inode *inode, enum fs_update_time type,
-			     unsigned int flags)
-{
-	int dirty = inode_update_time(inode, type, flags);
-
-	if (dirty <= 0)
-		return dirty;
-
-	if (type == FS_UPD_CMTIME)
-		set_bit(FUSEX_I_CMTIME_DIRTY, &get_fuse_inode(inode)->state);
-	__mark_inode_dirty(inode, dirty);
-
-	return 0;
+	fuse_invalidate_attr_mask(inode, STATX_CTIME);
 }
 
 static struct inode *fusex_do_lookup(struct inode *base, const struct qstr *name)
@@ -1034,7 +1056,7 @@ static int fusex_getattr(struct mnt_idmap *idmap, const struct path *path, struc
 	}
 
 	if ((flags & AT_STATX_SYNC_TYPE) != AT_STATX_DONT_SYNC) {
-		err = fusex_refresh_attr_unlocked(inode, request_mask & ~STATX_ATIME);
+		err = fusex_refresh_attr_unlocked(inode, request_mask);
 		if (err)
 			return err;
 	}
@@ -1197,7 +1219,7 @@ static int fusex_send_setxattr(struct inode *inode, const char *name, const void
 		return err;
 	}
 
-	fusex_update_ctime(inode);
+	fusex_ctime_changed(inode);
 
 	return 0;
 }
@@ -1239,7 +1261,6 @@ static int fusex_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	fusex_attr_changed(inode);
 	set_cached_acl(inode, type, acl);
-	inode_set_ctime_current(inode);
 	if (update_mode) {
 		struct fuse_setstatx_in inarg;
 
@@ -1247,12 +1268,9 @@ static int fusex_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 		memset(&inarg, 0, sizeof(inarg));
 		inarg.stat.mask |= STATX_MODE;
 		inarg.stat.mode = inode->i_mode & 07777;
-		fusex_get_ctime(inode, &inarg.stat);
 
 		err = fusex_send_setstatx(inode, &inarg);
 		fusex_attr_changed(inode);
-	} else {
-		fusex_cmtime_dirty(inode);
 	}
 
 	return err;
@@ -1501,7 +1519,7 @@ static int fusex_remove(struct inode *dir, struct dentry *dentry)
 	fusex_attr_changed(inode);
 	if (inode->i_nlink)
 		drop_nlink(inode);
-	fusex_update_ctime(inode);
+	fusex_ctime_changed(inode);
 	fusex_dir_modified(dir);
 
 	return 0;
@@ -1571,12 +1589,10 @@ static int fusex_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct 
 	fusex_attr_changed(inode);
 	setattr_copy(idmap, inode, iattr);
 	if (iattr->ia_valid & ATTR_SIZE) {
-		struct fuse_inode *fi = get_fuse_inode(inode);
 		loff_t old_size = inode->i_size;
 
-		spin_lock(&fi->lock);
 		i_size_write(inode, iattr->ia_size);
-		spin_unlock(&fi->lock);
+		fuse_invalidate_attr_mask(inode, STATX_BLOCKS);
 		fusex_extend_file(inode, old_size, inode->i_size);
 		truncate_pagecache(inode, inode->i_size);
 	}
@@ -1610,12 +1626,12 @@ static int fusex_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	if (err)
 		return err;
 
-	fusex_update_ctime(oldinode);
+	fusex_ctime_changed(oldinode);
 	if (newinode) {
 		fusex_attr_changed(newinode);
 		if (!(flags & RENAME_EXCHANGE) && newinode->i_nlink)
 			drop_nlink(newinode);
-		fusex_update_ctime(newinode);
+		fusex_ctime_changed(newinode);
 	}
 
 	fusex_dir_modified(olddir);
@@ -1645,7 +1661,7 @@ static int fusex_link(struct dentry *dentry, struct inode *newdir, struct dentry
 	fusex_attr_changed(inode);
 	ihold(inode);
 	inc_nlink(inode);
-	fusex_update_ctime(inode);
+	fusex_ctime_changed(inode);
 	fusex_dir_modified(newdir);
 	d_instantiate(newdentry, inode);
 
@@ -1675,7 +1691,6 @@ static int fusex_permission(struct mnt_idmap *idmap, struct inode *inode, int ma
 
 static const struct inode_operations fusex_file_inode_operations = {
 	.permission	= fusex_permission,
-	.update_time	= fusex_update_time,
 	.getattr	= fusex_getattr,
 	.setattr	= fusex_setattr,
 	.get_inode_acl	= fusex_get_acl,
@@ -1703,17 +1718,53 @@ static const struct inode_operations fusex_dir_inode_operations = {
 	.link		= fusex_link,
 };
 
+static const char *fusex_get_link(struct dentry *dentry, struct inode *inode,
+				  struct delayed_call *callback)
+{
+	FUSE_ARGS(args);
+	ssize_t res;
+	char *link;
+
+	if (!dentry)
+		return ERR_PTR(-ECHILD);
+
+	link = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!link)
+		return ERR_PTR(-ENOMEM);
+
+	args.opcode = FUSE_READLINK;
+	ADD_IN_ARG_ZERO(args);
+	ADD_OUT_ARG(args, PAGE_SIZE - 1, link);
+	args.out_argvar = true;
+	res = fusex_inode_request(inode, &args);
+	if (res < 0) {
+		kfree(link);
+		return ERR_PTR(res);
+	}
+
+	link[res] = '\0';
+	set_delayed_call(callback, kfree_link, link);
+
+	return link;
+}
+
 static const struct inode_operations fusex_symlink_inode_operations = {
 	.permission	= fusex_permission,
 	.getattr	= fusex_getattr,
 	.setattr	= fusex_setattr,
-	.get_link	= page_get_link,
+	.get_link	= fusex_get_link,
 	.listxattr	= fusex_listxattr,
+};
+
+struct fuse_release_args {
+	struct fuse_args args;
+	struct fuse_release_in inarg;
+	struct inode *inode;
 };
 
 struct fusex_dir_file {
 	struct fuse_file ff;
-	union fuse_file_args args;
+	struct fuse_release_args ra;
 	struct work_struct release_work;
 };
 
@@ -1724,7 +1775,7 @@ static struct fuse_file *fusex_file_alloc(void)
 	if (!f)
 		return NULL;
 
-	f->ff.args = &f->args;
+	ADD_IN_ARG_S(f->ra.args, &f->ra.inarg);
 
 	return &f->ff;
 }
@@ -1745,7 +1796,6 @@ static int fusex_send_opendir(struct fuse_file *ff, struct inode *inode)
 	err = fusex_inode_request(inode, &args);
 	if (!err) {
 		ff->fh = outarg.fh;
-		ff->open_flags = FOPEN_CACHE_DIR;
 		ff->nodeid = get_node_id(inode);
 	}
 	return err;
@@ -1754,14 +1804,10 @@ static int fusex_send_opendir(struct fuse_file *ff, struct inode *inode)
 static int fusex_dir_open(struct inode *inode, struct file *file)
 {
 	struct fuse_file *ff __free(kfree) = fusex_file_alloc();
-	struct fuse_release_args *ra;
 	int err;
 
 	if (!ff)
 		return -ENOMEM;
-
-	ra = &ff->args->release_args;
-	ADD_IN_ARG_S(ra->args, &ra->inarg);
 
 	err = fusex_send_opendir(ff, inode);
 	if (err)
@@ -1775,7 +1821,7 @@ static void fusex_release_work(struct work_struct *work)
 {
 	struct fusex_dir_file *f = container_of(work, struct fusex_dir_file, release_work);
 
-	iput(f->args.release_args.inode);
+	iput(f->ra.inode);
 	kfree(f);
 }
 
@@ -1783,7 +1829,7 @@ static void fusex_release_work(struct work_struct *work)
 static void fusex_release_end(struct fuse_args *args, int error)
 {
 	struct fuse_release_args *ra = container_of(args, typeof(*ra), args);
-	struct fusex_dir_file *f = container_of(ra, struct fusex_dir_file, args.release_args);
+	struct fusex_dir_file *f = container_of(ra, struct fusex_dir_file, ra);
 
 	INIT_WORK(&f->release_work, fusex_release_work);
 	queue_work(fusex_wq, &f->release_work);
@@ -1793,7 +1839,7 @@ static int fusex_dir_release(struct inode *inode, struct file *file)
 {
 	struct fuse_mount *fm = get_fuse_mount(inode);
 	struct fuse_file *ff = file->private_data;
-	struct fuse_release_args *ra = &ff->args->release_args;
+	struct fuse_release_args *ra = &container_of(ff, struct fusex_dir_file, ff)->ra;
 
 	ra->inarg.fh = ff->fh;
 
@@ -1810,60 +1856,18 @@ static int fusex_dir_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-/* The readdir cache compares the mtime when reading from the start */
-static int fusex_readdir(struct file *file, struct dir_context *ctx)
-{
-	if (!ctx->pos) {
-		int err = fusex_refresh_attr(file_inode(file), false);
-
-		if (err)
-			return err;
-	}
-
-	return fuse_readdir(file, ctx);
-}
-
 static const struct file_operations fusex_dir_operations = {
 	.llseek		= generic_file_llseek,
 	.read		= generic_read_dir,
-	.iterate_shared	= fusex_readdir,
+	.iterate_shared	= fuse_readdir,
 	.open		= fusex_dir_open,
 	.release	= fusex_dir_release,
-	.fsync		= simple_fsync_noflush,
-};
-
-static int fusex_symlink_read_folio(struct file *null, struct folio *folio)
-{
-	struct inode *inode = folio->mapping->host;
-	struct fuse_folio_desc desc = { .length = folio_size(folio) - 1 };
-	struct fuse_args_pages ap = {};
-	ssize_t res;
-
-	ap.args.opcode = FUSE_READLINK;
-	ADD_IN_ARG_ZERO(ap.args);
-	ADD_OUT_ARG(ap.args, desc.length, NULL);
-	ap.args.out_pages = true;
-	ap.args.out_argvar = true;
-	ap.args.page_zeroing = true;
-	ap.num_folios = 1;
-	ap.folios = &folio;
-	ap.descs = &desc;
-	res = fusex_inode_request(inode, &ap.args);
-	if (res >= 0) {
-		folio_mark_uptodate(folio);
-		res = 0;
-	}
-	folio_unlock(folio);
-	return res;
-}
-
-static const struct address_space_operations fusex_symlink_aops = {
-	.read_folio	= fusex_symlink_read_folio,
+	.fsync		= fusex_fsync,
 };
 
 static void fusex_init_inode(struct inode *inode)
 {
-	struct fuse_inode *fi = get_fuse_inode(inode);
+	inode->i_flags |= S_NOCMTIME;
 
 	switch (inode->i_mode & S_IFMT) {
 	case S_IFREG:
@@ -1874,15 +1878,12 @@ static void fusex_init_inode(struct inode *inode)
 		break;
 
 	case S_IFDIR:
-		spin_lock_init(&fi->rdc.lock);
 		inode->i_op = &fusex_dir_inode_operations;
 		inode->i_fop = &fusex_dir_operations;
 		break;
 
 	case S_IFLNK:
 		inode->i_op = &fusex_symlink_inode_operations;
-		inode->i_data.a_ops = &fusex_symlink_aops;
-		inode_nohighmem(inode);
 		break;
 
 	case S_IFCHR:
@@ -1982,10 +1983,7 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 	/* A request has to fit the payload buffer of any ring entry */
 	max_payload = fuse_uring_max_payload(fm->fc->chan);
 
-	fm->fc->minor = outarg_in.minor;
-	/* FUSE_NOTIFY_REPLY has its header in the payload too */
-	fm->fc->max_write = min_t(size_t, outarg_in.max_write,
-				  max_payload - sizeof(struct fuse_notify_retrieve_in));
+	fm->fc->max_write = min_t(size_t, outarg_in.max_write, max_payload);
 	fm->fc->max_pages = min_t(size_t, max_payload >> PAGE_SHIFT,
 				  min_t(unsigned int, fm->fc->max_pages_limit,
 					max_t(unsigned int, outarg_in.max_pages, 1)));
@@ -2023,7 +2021,6 @@ static int fusex_fill_super(struct super_block *sb, struct fs_context *fsc)
 	struct inode *inode;
 	struct fusex_id id;
 	struct fuse_statx_out statx;
-	struct fuse_chan_param cp = {};
 	int err;
 
 	fm->sb = sb;
@@ -2051,7 +2048,7 @@ static int fusex_fill_super(struct super_block *sb, struct fs_context *fsc)
 	sb->s_blocksize = PAGE_SIZE;
 	sb->s_blocksize_bits = PAGE_SHIFT;
 	sb->s_flags &= SB_RDONLY;
-	sb->s_flags |= SB_POSIXACL;
+	sb->s_flags |= SB_POSIXACL | SB_NOATIME;
 
 	err = fusex_send_init(fm, &id, &statx);
 	if (err)
@@ -2069,14 +2066,7 @@ static int fusex_fill_super(struct super_block *sb, struct fs_context *fsc)
 	if (!sb->s_root)
 		return -ENOMEM;
 
-	fc->parallel_dirops = true;
-	fc->conn_init = 1;
 	fc->destroy = true;
-
-	cp.minor = fc->minor;
-	cp.max_write = fc->max_write;
-	cp.max_pages = fc->max_pages;
-	fuse_chan_set_initialized(fc->chan, &cp);
 
 	return 0;
 }
@@ -2089,7 +2079,7 @@ static int fusex_new_conn(struct fs_context *fsc, struct fuse_dev *fud)
 {
 	struct fuse_conn *fc __free(kfree) = kmalloc_obj(*fc);
 	struct fuse_mount *fm __free(kfree) = kzalloc_obj(*fm);
-	struct fuse_chan *fch __free(fuse_chan_free) = fuse_dev_chan_new();
+	struct fuse_chan *fch __free(fuse_chan_free) = fuse_chan_new();
 	int err;
 
 	if (!fch || !fc || !fm)
@@ -2100,9 +2090,6 @@ static int fusex_new_conn(struct fs_context *fsc, struct fuse_dev *fud)
 		return err;
 
 	fuse_conn_init(fc, fm, fsc->user_ns, fch);
-	fc->release = fuse_free_conn;
-	/* No mount options: like virtiofs, any process in the user namespace */
-	fc->allow_other = 1;
 	fsc->s_fs_info = fm;
 	retain_and_null_ptr(fc);
 	retain_and_null_ptr(fm);
@@ -2207,7 +2194,7 @@ static void fusex_kill_sb_anon(struct super_block *sb)
 {
 	struct fuse_mount *fm = get_fuse_mount_super(sb);
 
-	/* No flush on close, write back while the server is still there */
+	/* No flush on close: write back and sync while the server is still there */
 	if (sb->s_root)
 		sync_filesystem(sb);
 
@@ -2218,6 +2205,8 @@ static void fusex_kill_sb_anon(struct super_block *sb)
 	kill_anon_super(sb);
 	fuse_mount_destroy(fm);
 }
+
+MODULE_ALIAS_FS("fusex");
 
 static struct file_system_type fusex_fs_type = {
 	.owner		= THIS_MODULE,

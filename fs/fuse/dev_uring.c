@@ -13,21 +13,11 @@
 #include <linux/fs.h>
 #include <linux/io_uring/cmd.h>
 
-static bool __read_mostly enable_uring;
-module_param(enable_uring, bool, 0644);
-MODULE_PARM_DESC(enable_uring,
-		 "Enable userspace communication through io-uring");
-
 #define FUSE_URING_IOV_SEGS 2 /* header and payload */
 #define FUSE_URING_IOV_HEADERS 0
 #define FUSE_URING_IOV_PAYLOAD 1
 
 #define FUSE_URING_ADD_QUEUE_FLAGS	(FUSE_URING_ZERO_COPY)
-
-bool fuse_uring_enabled(void)
-{
-	return enable_uring;
-}
 
 struct fuse_uring_pdu {
 	struct fuse_ring_ent *ent;
@@ -37,8 +27,6 @@ struct fuse_zero_copy_bvs {
 	unsigned int nr_bvs;
 	struct bio_vec bvs[];
 };
-
-static const struct fuse_iqueue_ops fuse_io_uring_ops;
 
 enum fuse_uring_header_type {
 	/* struct fuse_in_header / struct fuse_out_header */
@@ -216,49 +204,6 @@ void fuse_uring_abort_end_requests(struct fuse_ring *ring)
 	}
 }
 
-static bool ent_list_request_expired(struct fuse_chan *fch, struct list_head *list)
-{
-	struct fuse_ring_ent *ent;
-	struct fuse_req *req;
-
-	ent = list_first_entry_or_null(list, struct fuse_ring_ent, list);
-	if (!ent)
-		return false;
-
-	req = ent->fuse_req;
-
-	return time_is_before_jiffies(req->create_time +
-				      fch->timeout.req_timeout);
-}
-
-bool fuse_uring_request_expired(struct fuse_chan *fch)
-{
-	struct fuse_ring *ring = fch->ring;
-	struct fuse_ring_queue *queue;
-	int qid;
-
-	if (!ring)
-		return false;
-
-	for (qid = 0; qid < ring->nr_queues; qid++) {
-		queue = READ_ONCE(ring->queues[qid]);
-		if (!queue)
-			continue;
-
-		spin_lock(&queue->lock);
-		if (fuse_request_expired(fch, &queue->fuse_req_queue) ||
-		    fuse_request_expired(fch, &queue->fuse_req_bg_queue) ||
-		    ent_list_request_expired(fch, &queue->ent_w_req_queue) ||
-		    ent_list_request_expired(fch, &queue->ent_in_userspace)) {
-			spin_unlock(&queue->lock);
-			return true;
-		}
-		spin_unlock(&queue->lock);
-	}
-
-	return false;
-}
-
 void fuse_uring_destruct(struct fuse_chan *fch)
 {
 	struct fuse_ring *ring = fch->ring;
@@ -303,7 +248,6 @@ static struct fuse_ring *fuse_uring_create(struct fuse_chan *fch)
 {
 	struct fuse_ring *ring;
 	size_t nr_queues = num_possible_cpus();
-	size_t max_payload_size;
 
 	ring = kzalloc_obj(*ring, GFP_KERNEL_ACCOUNT);
 	if (!ring)
@@ -313,9 +257,6 @@ static struct fuse_ring *fuse_uring_create(struct fuse_chan *fch)
 				    GFP_KERNEL_ACCOUNT);
 	if (!ring->queues)
 		goto out_err;
-
-	max_payload_size = max(FUSE_MIN_READ_BUFFER, fch->max_write);
-	max_payload_size = max(max_payload_size, fch->max_pages * PAGE_SIZE);
 
 	spin_lock(&fch->lock);
 	if (!fch->connected) {
@@ -327,7 +268,6 @@ static struct fuse_ring *fuse_uring_create(struct fuse_chan *fch)
 
 	ring->nr_queues = nr_queues;
 	ring->chan = fch;
-	ring->max_payload_sz = max_payload_size;
 	smp_store_release(&fch->ring, ring);
 
 	spin_unlock(&fch->lock);
@@ -339,16 +279,9 @@ out_err:
 	return NULL;
 }
 
-void fuse_uring_conn_init(struct fuse_chan *fch)
-{
-	if (fuse_uring_create(fch))
-		fch->io_uring = 1;
-}
-
 /*
- * No /dev/fuse data path on this channel.  FUSE_INIT comes over the ring too, so
- * entries are registered before max_write and max_pages are known: the first
- * entry sets max_payload_sz.  Interrupts can only go to /dev/fuse.
+ * FUSE_INIT comes over the ring too, so entries are registered before max_write
+ * and max_pages are known: the first entry sets max_payload_sz.
  */
 int fuse_uring_ring_only_init(struct fuse_chan *fch)
 {
@@ -356,13 +289,6 @@ int fuse_uring_ring_only_init(struct fuse_chan *fch)
 
 	if (!ring)
 		return -ENOMEM;
-
-	ring->max_payload_sz = 0;
-	fch->ring_only = true;
-	fch->io_uring = 1;
-	fch->no_interrupt = true;
-	fch->iq.ops = &fuse_io_uring_ops;
-	fuse_chan_set_initialized(fch, NULL);
 
 	return 0;
 }
@@ -402,7 +328,6 @@ static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
 	INIT_LIST_HEAD(&queue->fuse_req_bg_queue);
 	INIT_LIST_HEAD(&queue->ent_released);
 
-	fuse_pqueue_init(&queue->fpq);
 	queue->fpq.processing = pq;
 
 	spin_lock(&fch->lock);
@@ -651,8 +576,8 @@ static int fuse_uring_out_header_has_err(struct fuse_out_header *oh,
 
 	err = -EINVAL;
 	if (oh->unique == 0) {
-		/* Not supported through io-uring yet */
-		pr_warn_once("notify through fuse-io-uring not supported\n");
+		/* A notification has a ring command of its own */
+		pr_warn_once("notification in a ring commit\n");
 		goto err;
 	}
 
@@ -665,19 +590,11 @@ static int fuse_uring_out_header_has_err(struct fuse_out_header *oh,
 	}
 
 	err = -ENOENT;
-	if ((oh->unique & ~FUSE_INT_REQ_BIT) != req->in.h.unique) {
+	if (oh->unique != req->in.h.unique) {
 		pr_warn_ratelimited("unique mismatch, expected: %llu got %llu\n",
-				    req->in.h.unique,
-				    oh->unique & ~FUSE_INT_REQ_BIT);
+				    req->in.h.unique, oh->unique);
 		goto err;
 	}
-
-	/*
-	 * Is it an interrupt reply ID?
-	 * XXX: Not supported through fuse-io-uring yet, it should not even
-	 *      find the request - should not happen.
-	 */
-	WARN_ON_ONCE(oh->unique & FUSE_INT_REQ_BIT);
 
 	err = 0;
 err:
@@ -781,7 +698,6 @@ static int setup_fuse_copy_state(struct fuse_copy_state *cs,
 	if (ent->zero_copied)
 		cs->skip_folio_copy = true;
 
-	cs->is_uring = true;
 	cs->req = req;
 
 	return 0;
@@ -925,7 +841,7 @@ static int fuse_uring_args_to_ring(struct fuse_req *req,
 
 	/* copy the payload */
 	err = fuse_copy_args(&cs, num_args, args->in_pages,
-			     (struct fuse_arg *)in_args, 0);
+			     (struct fuse_arg *)in_args);
 	fuse_copy_finish(&cs);
 	if (err) {
 		pr_info_ratelimited("%s fuse_copy_args failed\n", __func__);
@@ -1183,7 +1099,6 @@ static struct fuse_req *fuse_uring_ent_assign_req(struct fuse_ring_ent *ent)
 
 /*
  * Read data from the ring buffer, which user space has written to
- * This is comparible with handling of classical write(/dev/fuse).
  * Also make the ring request available again for new fuse requests.
  */
 static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
@@ -1349,8 +1264,7 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
 	/*
 	 * Fetching the next request is absolutely required as queued
 	 * fuse requests would otherwise not get processed - committing
-	 * and fetching is done in one step vs legacy fuse, which has separated
-	 * read (fetch request) and write (commit result).
+	 * and fetching is done in one step.
 	 *
 	 * If there is no next request or if all buffers are busy (if using a
 	 * bufpool), the cmd is not returned to userspace. The entry is left
@@ -1397,7 +1311,6 @@ static int fuse_uring_do_register(struct fuse_ring_ent *ent,
 	struct fuse_ring_queue *queue = ent->queue;
 	struct fuse_ring *ring = queue->ring;
 	struct fuse_chan *fch = ring->chan;
-	struct fuse_iqueue *fiq = &fch->iq;
 
 	spin_lock(&fch->lock);
 	/* abort teardown path is running or has run */
@@ -1421,7 +1334,6 @@ static int fuse_uring_do_register(struct fuse_ring_ent *ent,
 		bool ready = is_ring_ready(ring, queue->qid);
 
 		if (ready) {
-			WRITE_ONCE(fiq->ops, &fuse_io_uring_ops);
 			smp_store_release(&ring->ready, true);
 			wake_up_all(&fch->blocked_waitq);
 		}
@@ -1680,8 +1592,8 @@ static int fuse_uring_add_bufpool(struct io_uring_cmd *cmd,
 }
 
 /*
- * Notification on a ring only channel, the same message as written to /dev/fuse:
- * iov[0] has the fuse_out_header, iov[1] the rest.  No ring entry involved.
+ * Notification: iov[0] has the fuse_out_header, iov[1] the rest.  No ring entry
+ * involved.
  */
 static int fuse_uring_notify(struct io_uring_cmd *cmd, unsigned int issue_flags,
 			     struct fuse_chan *fch)
@@ -1693,9 +1605,6 @@ static int fuse_uring_notify(struct io_uring_cmd *cmd, unsigned int issue_flags,
 	struct fuse_copy_state cs;
 	struct iov_iter iter;
 	int err;
-
-	if (!fch->ring_only)
-		return -EOPNOTSUPP;
 
 	/* Can wait for a request that only the task submitting this can serve */
 	if (issue_flags & IO_URING_F_NONBLOCK)
@@ -1752,30 +1661,8 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	}
 	fch = fud->chan;
 
-	/*
-	 * The ring is sized from values negotiated by FUSE_INIT
-	 *
-	 * Pairs with smp_store_release() in fuse_chan_set_initialized()
-	 */
-	if (!smp_load_acquire(&fch->initialized))
-		return -EAGAIN;
-
-	if (fch->abort_with_err)
-		return -ECONNABORTED;
 	if (!fch->connected)
 		return -ENOTCONN;
-
-	/* Once a connection has io-uring enabled on it, it can't be disabled */
-	if (!enable_uring && !fch->io_uring) {
-		pr_info_ratelimited("fuse-io-uring is disabled by module parameter\n");
-		return -EOPNOTSUPP;
-	}
-
-	if (!fch->io_uring) {
-		pr_info_ratelimited(
-			"fuse-io-uring not enabled on this connection\n");
-		return -EOPNOTSUPP;
-	}
 
 	switch (cmd_op) {
 	case FUSE_IO_URING_CMD_REGISTER:
@@ -1783,11 +1670,6 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		if (err) {
 			pr_info_once("FUSE_IO_URING_CMD_REGISTER failed err=%d\n",
 				     err);
-			/* Nothing to fall back to on a ring only channel */
-			if (!fch->ring_only) {
-				fch->io_uring = 0;
-				wake_up_all(&fch->blocked_waitq);
-			}
 			return err;
 		}
 		break;
@@ -1886,7 +1768,7 @@ static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent)
 }
 
 /* queue a fuse request and send it if a ring entry is available */
-void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+void fuse_uring_queue_fuse_req(struct fuse_req *req)
 {
 	struct fuse_ring *ring = req->chan->ring;
 	struct fuse_ring_queue *queue;
@@ -1898,7 +1780,7 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 	if (!queue)
 		goto err;
 
-	fuse_request_assign_unique(fiq, req);
+	fuse_request_assign_unique(req);
 
 	spin_lock(&queue->lock);
 	err = -ENOTCONN;
@@ -1983,15 +1865,3 @@ bool fuse_uring_remove_pending_req(struct fuse_req *req)
 
 	return fuse_remove_pending_req(req, &queue->lock);
 }
-
-static const struct fuse_iqueue_ops fuse_io_uring_ops = {
-	/* should be send over io-uring as enhancement */
-	.send_forget = fuse_dev_queue_forget,
-
-	/*
-	 * could be send over io-uring, but interrupts should be rare,
-	 * no need to make the code complex
-	 */
-	.send_interrupt = fuse_dev_queue_interrupt,
-	.send_req = fuse_uring_queue_fuse_req,
-};
