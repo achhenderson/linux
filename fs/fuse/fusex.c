@@ -414,40 +414,45 @@ static struct inode *fusex_get_inode(struct super_block *sb, struct fusex_id *id
 
 static void fusex_extend_file(struct inode *inode, loff_t old_size, loff_t new_size)
 {
-	WARN_ON(new_size > inode->i_size);
-
 	if (old_size < new_size)
 		truncate_pagecache_range(inode, old_size, new_size - 1);
 }
 
-/* A fetch clears the mask before it has the reply, so that counts too */
+/* A fetch clears the mask before it has the reply, so what it is getting counts too */
 static bool fusex_attr_stale(struct fuse_inode *fi, u32 mask)
 {
 	if (READ_ONCE(fi->inval_mask) & mask)
 		return true;
 
-	/* The fetch has the mutex before it clears the mask */
+	/* The fetch sets fetch_mask before it clears the mask */
 	smp_rmb();
-	return mutex_is_locked(&fi->mutex);
+	return smp_load_acquire(&fi->fetch_mask) & mask;
 }
 
 /*
- * Mapped data is flushed first so that the reply includes it.  A change during
- * the request makes the reply useless.
+ * Mapped data is flushed first so that the reply includes it.  Returns 1 if a
+ * change during the request made the reply useless.  A write during it doesn't:
+ * write_end keeps the size and the times it invalidated stay invalid.
  */
 static int fusex_fetch_attr(struct inode *inode, bool perm_only)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_statx_out outarg;
 	struct fuse_statx *stat = &outarg.stat;
-	loff_t oldsize = i_size_read(inode);
+	u32 fetching = READ_ONCE(fi->inval_mask) & (perm_only ? FUSEX_ATTR_PERM : ~0U);
+	loff_t oldsize;
 	u64 attr_version;
 	int err;
 
-	set_mask_bits(&fi->inval_mask, perm_only ? FUSEX_ATTR_PERM : ~0U, 0);
+	WRITE_ONCE(fi->fetch_mask, fetching);
+	set_mask_bits(&fi->inval_mask, fetching, 0);
 
 	if (!perm_only && S_ISREG(inode->i_mode))
 		filemap_write_and_wait(inode->i_mapping);
+
+	spin_lock(&fi->lock);
+	fi->write_end = 0;
+	spin_unlock(&fi->lock);
 
 	attr_version = fuse_get_attr_version(get_fuse_conn(inode));
 	err = fusex_send_statx(inode, &outarg);
@@ -462,43 +467,42 @@ static int fusex_fetch_attr(struct inode *inode, bool perm_only)
 	if (fi->attr_version > attr_version) {
 		spin_unlock(&fi->lock);
 		fuse_invalidate_attr(inode);
-		return 0;
+		return 1;
 	}
+	oldsize = inode->i_size;
 	if (perm_only) {
 		fusex_set_mode(inode, stat->mode);
 		inode->i_uid = make_kuid(i_user_ns(inode), stat->uid);
 		inode->i_gid = make_kgid(i_user_ns(inode), stat->gid);
 	} else {
+		stat->size = max_t(u64, stat->size, fi->write_end);
 		fusex_set_attr(inode, stat);
 	}
 	spin_unlock(&fi->lock);
 
-	if (!perm_only && S_ISREG(inode->i_mode) && stat->size != oldsize) {
-		if (stat->size < oldsize)
-			truncate_pagecache(inode, stat->size);
-		else
-			invalidate_inode_pages2_range(inode->i_mapping,
-						      oldsize >> PAGE_SHIFT, -1);
-	}
+	/* Not a truncation: a write can have grown the file by now */
+	if (!perm_only && S_ISREG(inode->i_mode) && stat->size != oldsize)
+		invalidate_inode_pages2_range(inode->i_mapping,
+					      min_t(u64, stat->size, oldsize) >> PAGE_SHIFT, -1);
 
 	return 0;
 }
 
 /*
  * The inode is authoritative until it is invalidated, by the server or by an
- * operation that makes the server change it.
+ * operation that makes the server change it.  The server has the answer at any
+ * time, so this needs no i_rwsem.
  *
- * For a regular file this needs i_rwsem held exclusively to keep writers out of
- * the flush and the size update, unless @perm_only.  That leaves the rest
- * invalid.
+ * Asking only for the permissions of a regular file leaves the rest invalid: a
+ * path walk doesn't flush.
  *
  * Local changes can keep invalidating the reply: give up after a few tries and
  * leave it to the next user.
  */
-static int fusex_refresh_attr(struct inode *inode, bool perm_only)
+static int fusex_refresh_attr(struct inode *inode, u32 mask)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
-	const u32 mask = perm_only ? FUSEX_ATTR_PERM : ~0U;
+	const bool perm_only = mask == FUSEX_ATTR_PERM && S_ISREG(inode->i_mode);
 	int tries = 3;
 	int err = 0;
 
@@ -506,27 +510,15 @@ static int fusex_refresh_attr(struct inode *inode, bool perm_only)
 		return 0;
 
 	guard(mutex)(&fi->mutex);
-	while (!err && tries-- && (READ_ONCE(fi->inval_mask) & mask))
+	while (tries-- && (READ_ONCE(fi->inval_mask) & mask)) {
 		err = fusex_fetch_attr(inode, perm_only);
+		if (err <= 0)
+			break;
+	}
+	/* After the attributes, see fusex_attr_stale() */
+	smp_store_release(&fi->fetch_mask, 0);
 
-	return err;
-}
-
-static int fusex_refresh_attr_unlocked(struct inode *inode, u32 mask)
-{
-	int err;
-
-	if (!fusex_attr_stale(get_fuse_inode(inode), mask))
-		return 0;
-
-	if (!S_ISREG(inode->i_mode))
-		return fusex_refresh_attr(inode, false);
-
-	inode_lock(inode);
-	err = fusex_refresh_attr(inode, false);
-	inode_unlock(inode);
-
-	return err;
+	return min(err, 0);
 }
 
 /* Before the local update: a reply applied after this is not older than it */
@@ -539,7 +531,7 @@ static void fusex_attr_changed(struct inode *inode)
 	spin_unlock(&fi->lock);
 }
 
-/* Writers can share i_rwsem.  Returns the size this replaced. */
+/* Writers share i_rwsem and a fetch doesn't take it.  Returns the old size. */
 static loff_t fusex_grow_size(struct inode *inode, loff_t size)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -549,6 +541,7 @@ static loff_t fusex_grow_size(struct inode *inode, loff_t size)
 	old_size = inode->i_size;
 	if (size > old_size)
 		i_size_write(inode, size);
+	fi->write_end = max(fi->write_end, size);
 	spin_unlock(&fi->lock);
 
 	return old_size;
@@ -706,7 +699,7 @@ static ssize_t fusex_direct_io(struct kiocb *iocb, struct iov_iter *iter, size_t
 static ssize_t fusex_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
-	int err = fusex_refresh_attr_unlocked(inode, STATX_SIZE);
+	int err = fusex_refresh_attr(inode, STATX_SIZE);
 	loff_t size = i_size_read(inode);
 	size_t count;
 	ssize_t res;
@@ -762,33 +755,29 @@ static ssize_t fusex_direct_write(struct kiocb *iocb, struct iov_iter *from, siz
 	return res;
 }
 
-/* Removing privileges and fetching the size can't run next to other writers */
-static bool fusex_write_needs_excl(struct inode *inode)
-{
-	return !IS_NOSEC(inode) ||
-	       fusex_attr_stale(get_fuse_inode(inode), STATX_SIZE);
-}
-
-/* The data goes to the server, which orders the writes.  Only append needs EOF. */
+/*
+ * The data goes to the server, which orders the writes.  Only append needs EOF,
+ * and removing privileges can't run next to other writers.
+ */
 static ssize_t fusex_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
-	bool excl = (iocb->ki_flags & IOCB_APPEND) || fusex_write_needs_excl(inode);
+	bool append = iocb->ki_flags & IOCB_APPEND;
+	bool excl = append || !IS_NOSEC(inode);
 	ssize_t res = 0;
 
 	if (!excl) {
 		inode_lock_shared(inode);
-		if (fusex_write_needs_excl(inode)) {
+		if (!IS_NOSEC(inode)) {
 			inode_unlock_shared(inode);
 			excl = true;
 		}
 	}
-	if (excl) {
+	if (excl)
 		inode_lock(inode);
-		if (fusex_attr_stale(get_fuse_inode(inode), STATX_SIZE))
-			res = fusex_refresh_attr(inode, false);
-	}
+	if (append)
+		res = fusex_refresh_attr(inode, STATX_SIZE);
 	if (!res)
 		res = generic_write_checks(iocb, from);
 	if (res > 0) {
@@ -810,7 +799,7 @@ static ssize_t fusex_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 static loff_t fusex_file_llseek(struct file *file, loff_t offset, int whence)
 {
 	if (whence != SEEK_SET && whence != SEEK_CUR) {
-		int err = fusex_refresh_attr_unlocked(file_inode(file), STATX_SIZE);
+		int err = fusex_refresh_attr(file_inode(file), STATX_SIZE);
 
 		if (err)
 			return err;
@@ -837,7 +826,7 @@ static long fusex_file_fallocate(struct file *file, int mode, loff_t offset, lof
 
 	guard(rwsem_write)(&inode->i_rwsem);
 
-	err = fusex_refresh_attr(inode, false);
+	err = fusex_refresh_attr(inode, ~0U);
 	if (err)
 		return err;
 
@@ -847,7 +836,7 @@ static long fusex_file_fallocate(struct file *file, int mode, loff_t offset, lof
 			return err;
 	}
 
-	if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
+	if (!(mode & FALLOC_FL_KEEP_SIZE) && end > i_size_read(inode)) {
 		err = inode_newsize_ok(inode, end);
 		if (err)
 			return err;
@@ -863,11 +852,10 @@ static long fusex_file_fallocate(struct file *file, int mode, loff_t offset, lof
 	if (err)
 		return err;
 
-	if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
-		loff_t old_size = inode->i_size;
+	if (!(mode & FALLOC_FL_KEEP_SIZE)) {
+		loff_t old_size = fusex_grow_size(inode, end);
 
-		fusex_grow_size(inode, end);
-		fusex_extend_file(inode, old_size, inode->i_size);
+		fusex_extend_file(inode, old_size, end);
 	}
 
 	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
@@ -1099,7 +1087,7 @@ static int fusex_getattr(struct mnt_idmap *idmap, const struct path *path, struc
 	}
 
 	if ((flags & AT_STATX_SYNC_TYPE) != AT_STATX_DONT_SYNC) {
-		err = fusex_refresh_attr_unlocked(inode, request_mask);
+		err = fusex_refresh_attr(inode, request_mask);
 		if (err)
 			return err;
 	}
@@ -1578,7 +1566,7 @@ static int fusex_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct 
 	if (!fuse_allow_current_process(get_fuse_conn(inode)))
 		return -EACCES;
 
-	err = fusex_refresh_attr(inode, false);
+	err = fusex_refresh_attr(inode, ~0U);
 	if (err)
 		return err;
 
@@ -1586,7 +1574,7 @@ static int fusex_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct 
 	if (err)
 		return err;
 
-	if ((iattr->ia_valid & ATTR_SIZE) && iattr->ia_size != inode->i_size)
+	if ((iattr->ia_valid & ATTR_SIZE) && iattr->ia_size != i_size_read(inode))
 		iattr->ia_valid |= ATTR_MTIME | ATTR_CTIME;
 
 	memset(&inarg, 0, sizeof(inarg));
@@ -1632,12 +1620,16 @@ static int fusex_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct 
 	fusex_attr_changed(inode);
 	setattr_copy(idmap, inode, iattr);
 	if (iattr->ia_valid & ATTR_SIZE) {
-		loff_t old_size = inode->i_size;
+		struct fuse_inode *fi = get_fuse_inode(inode);
+		loff_t old_size;
 
+		spin_lock(&fi->lock);
+		old_size = inode->i_size;
 		i_size_write(inode, iattr->ia_size);
+		spin_unlock(&fi->lock);
 		fuse_invalidate_attr_mask(inode, STATX_BLOCKS);
-		fusex_extend_file(inode, old_size, inode->i_size);
-		truncate_pagecache(inode, inode->i_size);
+		fusex_extend_file(inode, old_size, iattr->ia_size);
+		truncate_pagecache(inode, iattr->ia_size);
 	}
 
 	return 0;
@@ -1723,8 +1715,7 @@ static int fusex_permission(struct mnt_idmap *idmap, struct inode *inode, int ma
 		if (mask & MAY_NOT_BLOCK)
 			return -ECHILD;
 
-		/* i_rwsem may or may not be held here */
-		err = fusex_refresh_attr(inode, S_ISREG(inode->i_mode));
+		err = fusex_refresh_attr(inode, FUSEX_ATTR_PERM);
 		if (err)
 			return err;
 	}

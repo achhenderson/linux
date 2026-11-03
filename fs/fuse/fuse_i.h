@@ -65,6 +65,12 @@ struct fuse_inode {
 	/** @inval_mask: Which attributes are invalid */
 	u32 inval_mask;
 
+	/** @fetch_mask: Which invalid attributes the running fetch is getting */
+	u32 fetch_mask;
+
+	/** @write_end: Furthest end of a write since the running fetch started */
+	loff_t write_end;
+
 	/** @i_btime: Cache birthtime */
 	struct timespec64 i_btime;
 
