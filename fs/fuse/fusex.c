@@ -105,6 +105,7 @@ static struct inode *fusex_alloc_inode(struct super_block *sb)
 
 	mutex_init(&fi->mutex);
 	spin_lock_init(&fi->lock);
+	init_rwsem(&fi->mkwrite_lock);
 
 	return &fi->inode;
 }
@@ -650,6 +651,48 @@ static void fusex_put_pages(struct fuse_args_pages *ap, struct iov_iter *iter, b
 	}
 }
 
+/*
+ * The folio a fault reads during a direct write is stale, and the invalidation
+ * after the write drops it.  But a store through a shared mapping can dirty it
+ * first, and then laundering it overwrites the write on the server.  So the
+ * write holds mkwrite_lock shared from flushing its range to invalidating it,
+ * and fusex_page_mkwrite() holds it exclusively.  The buffer is pinned before
+ * the lock is taken: pinning it can take mmap_lock, which a fault holds while
+ * it waits for the lock.
+ */
+static ssize_t fusex_write_chunk(struct inode *inode, struct file *file,
+				 struct fuse_args_pages *ap, loff_t pos, size_t len)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct address_space *mapping = inode->i_mapping;
+	ssize_t res;
+
+	down_read(&fi->mkwrite_lock);
+
+	/* Nothing dirties a folio under the lock, so flushing is enough */
+	res = filemap_write_and_wait_range(mapping, pos, pos + len - 1);
+	if (!res)
+		res = fusex_send_write(inode, file, ap, pos, len);
+	if (res > 0) {
+		/* Before the invalidation: a fault after it must see the new size */
+		loff_t old_size = fusex_grow_size(inode, pos + res);
+
+		fusex_extend_file(inode, old_size, pos);
+
+		/*
+		 * A fault during the write can have read the old data.  Another
+		 * writer can be in the hole, so the folio zeroed for it can't
+		 * stay either.
+		 */
+		invalidate_inode_pages2_range(mapping, min(old_size, pos) >> PAGE_SHIFT,
+					      (pos + res - 1) >> PAGE_SHIFT);
+	}
+
+	up_read(&fi->mkwrite_lock);
+
+	return res;
+}
+
 /* Sends @count bytes of @iter to or from the server at iocb->ki_pos */
 static ssize_t fusex_direct_io(struct kiocb *iocb, struct iov_iter *iter, size_t count)
 {
@@ -680,7 +723,7 @@ static ssize_t fusex_direct_io(struct kiocb *iocb, struct iov_iter *iter, size_t
 			break;
 		}
 
-		res = write ? fusex_send_write(file_inode(file), file, &ap, pos, got) :
+		res = write ? fusex_write_chunk(file_inode(file), file, &ap, pos, got) :
 			      fusex_send_read(file, &ap, pos, got);
 		fusex_put_pages(&ap, iter, !write && res > 0);
 
@@ -723,34 +766,10 @@ static ssize_t fusex_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 static ssize_t fusex_direct_write(struct kiocb *iocb, struct iov_iter *from, size_t count)
 {
-	struct inode *inode = file_inode(iocb->ki_filp);
-	loff_t pos = iocb->ki_pos;
-	loff_t old_size;
-	ssize_t res;
+	ssize_t res = fusex_direct_io(iocb, from, count);
 
-	/*
-	 * The writeback of a dirty folio must not overwrite this later.  -EBUSY
-	 * leaves a stale folio at worst, the server gets the data regardless.
-	 */
-	res = kiocb_invalidate_pages(iocb, count);
-	if (res && res != -EBUSY)
-		return res;
-
-	res = fusex_direct_io(iocb, from, count);
-	if (res <= 0)
-		return res;
-
-	/* Before the invalidation: a fault after it must see the new size */
-	old_size = fusex_grow_size(inode, iocb->ki_pos);
-	fusex_extend_file(inode, old_size, pos);
-
-	/*
-	 * A fault during the write can have read the old data.  Another writer
-	 * can be in the hole, so the folio zeroed for it can't stay either.
-	 */
-	invalidate_inode_pages2_range(inode->i_mapping, min(old_size, pos) >> PAGE_SHIFT,
-				      (iocb->ki_pos - 1) >> PAGE_SHIFT);
-	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODIFY);
+	if (res > 0)
+		fuse_invalidate_attr_mask(file_inode(iocb->ki_filp), FUSE_STATX_MODIFY);
 
 	return res;
 }
@@ -898,9 +917,16 @@ static int fusex_fsync(struct file *file, loff_t start, loff_t end, int datasync
  */
 static vm_fault_t fusex_page_mkwrite(struct vm_fault *vmf)
 {
-	vm_fault_t ret = filemap_page_mkwrite(vmf);
+	struct inode *inode = file_inode(vmf->vma->vm_file);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	vm_fault_t ret;
 
-	fuse_invalidate_attr_mask(file_inode(vmf->vma->vm_file), FUSE_STATX_MODIFY);
+	/* See fusex_write_chunk() */
+	down_write(&fi->mkwrite_lock);
+	ret = filemap_page_mkwrite(vmf);
+	up_write(&fi->mkwrite_lock);
+
+	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODIFY);
 
 	return ret;
 }

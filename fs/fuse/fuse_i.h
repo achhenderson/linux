@@ -71,6 +71,12 @@ struct fuse_inode {
 	/** @write_end: Furthest end of a write since the running fetch started */
 	loff_t write_end;
 
+	/**
+	 * @mkwrite_lock: Shared by a direct write from flushing its range to
+	 * invalidating it, exclusive to make a folio writable through a mapping
+	 */
+	struct rw_semaphore mkwrite_lock;
+
 	/** @i_btime: Cache birthtime */
 	struct timespec64 i_btime;
 
